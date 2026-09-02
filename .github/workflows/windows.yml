@@ -1,0 +1,73 @@
+name: Windows release verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      NUGET_XMLDOC_MODE: skip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: |
+            desktop/packages.lock.json
+            desktop.tests/packages.lock.json
+
+      - name: Restore locked dependencies
+        shell: pwsh
+        run: dotnet restore desktop.tests/MishaWeb.SmokeTests.csproj --locked-mode
+
+      - name: Strict build
+        shell: pwsh
+        run: dotnet build desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-restore --warnaserror -p:ContinuousIntegrationBuild=true
+
+      - name: Smoke and policy tests
+        shell: pwsh
+        run: dotnet run --project desktop.tests/MishaWeb.SmokeTests.csproj --configuration Release --no-build --no-restore
+
+      - name: Publish clean framework-dependent release
+        shell: powershell
+        run: .\build\Publish-MishaWeb.ps1 -Mode FrameworkDependent -SkipChecks
+
+      - name: Revalidate framework-dependent release
+        shell: powershell
+        run: .\build\Publish-MishaWeb.ps1 -Mode FrameworkDependent -ValidateOnly
+
+      - name: Publish clean self-contained release
+        shell: powershell
+        run: .\build\Publish-MishaWeb.ps1 -Mode Portable -SkipChecks
+
+      - name: Revalidate self-contained release
+        shell: powershell
+        run: .\build\Publish-MishaWeb.ps1 -Mode Portable -ValidateOnly
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: MishaWeb-windows-x64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            desktop/publish/**
+            desktop/portable/**

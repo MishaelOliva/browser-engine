@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <DisableWinExeOutputInference>true</DisableWinExeOutputInference>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>MishaWeb.SmokeTests</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(ContinuousIntegrationBuild)' == 'true'">true</RestoreLockedMode>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\desktop\MishaWeb.csproj" />
+  </ItemGroup>
+
+  <Target Name="RunProbeLaunchContractRegression" AfterTargets="Build">
+    <Exec
+      Command="node &quot;$(MSBuildProjectDirectory)\ProbeLaunchContract.test.mjs&quot;"
+      WorkingDirectory="$(MSBuildProjectDirectory)\.." />
+    <Exec
+      Command="node &quot;$(MSBuildProjectDirectory)\MemoryChurnAnalysis.test.mjs&quot;"
+      WorkingDirectory="$(MSBuildProjectDirectory)\.." />
+  </Target>
+</Project>

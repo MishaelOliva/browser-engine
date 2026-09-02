@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <PlatformTarget>x64</PlatformTarget>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <AssemblyName>MishaWeb</AssemblyName>
+    <RootNamespace>MishaWeb</RootNamespace>
+    <Version>2.2.0</Version>
+    <AssemblyVersion>2.2.0.0</AssemblyVersion>
+    <FileVersion>2.2.0.0</FileVersion>
+    <InformationalVersion>2.2.0</InformationalVersion>
+    <AssemblyTitle>MishaWeb</AssemblyTitle>
+    <Product>MishaWeb</Product>
+    <Description>A resource-light native Windows browser powered by WebView2.</Description>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\Brand\mishaweb-bunny-logo-v2.ico</ApplicationIcon>
+    <DebugType>embedded</DebugType>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode Condition="'$(ContinuousIntegrationBuild)' == 'true'">true</RestoreLockedMode>
+    <Deterministic>true</Deterministic>
+    <!-- Custom controls are code-only and never persisted by the WinForms designer. Keep every other analyzer warning enabled. -->
+    <NoWarn>$(NoWarn);WFO1000</NoWarn>
+    <!-- The loader is embedded and extracted by WebView2LoaderBootstrap. -->
+    <WebView2NeverCopyLoaderDllToOutputDirectory>true</WebView2NeverCopyLoaderDllToOutputDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="[1.0.4129.50]" PrivateAssets="all" GeneratePathProperty="true" />
+    <EmbeddedResource Include="$(PkgMicrosoft_Web_WebView2)\runtimes\win-x64\native\WebView2Loader.dll" LogicalName="MishaWeb.WebView2Loader.dll" />
+    <EmbeddedResource Include="Assets\StartPage\Source\bunny-night-garden-v2.jpg" LogicalName="MishaWeb.StartPageBackdrop.jpg" />
+    <EmbeddedResource Include="Assets\Brand\mishaweb-bunny-logo-runtime.png" LogicalName="MishaWeb.Brand.BunnyLogo.png" />
+  </ItemGroup>
+
+  <Target Name="RemoveUnusedWebView2WpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <_WebView2WpfReference Include="@(Reference)" Condition="'%(Reference.Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+      <Reference Remove="@(_WebView2WpfReference)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveWebView2XmlDocumentationFromPublish" AfterTargets="Publish">
+    <ItemGroup>
+      <_WebView2XmlDocumentation Include="$(PublishDir)Microsoft.Web.WebView2.*.xml" />
+      <_WebView2XmlDocumentation Include="$(PublishDir)MishaWeb.pdb" />
+      <_WebView2XmlDocumentation Include="$(PublishDir)MishaWeb.deps.json" />
+      <_WebView2XmlDocumentation Include="$(PublishDir)MishaWeb.runtimeconfig.json" />
+    </ItemGroup>
+    <Delete Files="@(_WebView2XmlDocumentation)" />
+  </Target>
+</Project>
