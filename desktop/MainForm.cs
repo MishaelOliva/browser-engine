@@ -1,7 +1,8 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using Microsoft.Win32;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -67,7 +68,8 @@ internal readonly record struct ToolbarLayoutSnapshot(
 internal readonly record struct BrowserEnvironmentOptionsSnapshot(
     bool EnableTrackingPrevention,
     bool AreBrowserExtensionsEnabled,
-    bool ExclusiveUserDataFolderAccess);
+    bool ExclusiveUserDataFolderAccess,
+    string? AdditionalBrowserArguments = null);
 
 internal readonly record struct BrowserControllerProfileSnapshot(
     bool IsInPrivateModeEnabled,
@@ -90,6 +92,7 @@ public sealed class MainForm : Form
     private const int MaximumExtensionDisplayNameCharacters = 120;
     private const int MemoryScanIntervalMs = 15_000;
     private const int StandardMemoryScanIntervalMs = 60_000;
+    private const int IdleMemoryMaintenanceIntervalMs = 20_000;
     private const int MaximumStandardUnloadsPerSweep = 4;
     private const int MemoryScanCooldownSeconds = 1;
     private const int AddressSuggestionDebounceMs = 120;
@@ -116,6 +119,8 @@ public sealed class MainForm : Form
     private static readonly Font TabTitleFont = new("Segoe UI", 9f);
     private static readonly byte[] TransparentGif = Convert.FromBase64String(
         "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==");
+    private static readonly byte[] YouTubeScriptStubBytes =
+        "window.adsbygoogle = window.adsbygoogle || []; window.adsbygoogle.loaded = true; window.googletag = window.googletag || { cmd: [], apiReady: true };"u8.ToArray();
     private static readonly CoreWebView2WebResourceRequestSourceKinds DocumentRequestSources =
         CoreWebView2WebResourceRequestSourceKinds.Document;
     private static readonly CoreWebView2WebResourceRequestSourceKinds WorkerRequestSources =
@@ -157,6 +162,7 @@ public sealed class MainForm : Form
     private readonly Button closeFindButton = new();
     private readonly AnnouncingStatusLabel statusLabel = new();
     private readonly ToolTip toolTip = new() { AutoPopDelay = 7000, InitialDelay = 450, ReshowDelay = 100 };
+    private readonly IncognitoBadgeControl incognitoBadge;
     private readonly ContextMenuStrip appMenu = new();
     private readonly ContextMenuStrip tabMenu = new();
     private readonly ContextMenuStrip tabListMenu = new();
@@ -235,6 +241,10 @@ public sealed class MainForm : Form
     private bool addressBarEditing;
     private bool smartSearchBarEditing;
     private bool memorySweepRunning;
+    private DateTime lastUserInteractionUtc = DateTime.UtcNow;
+    private bool isAppIdleLowPowerActive;
+    private const int AppIdleThresholdMinutes = 5;
+    private const long MaxInactiveRendererPrivateBytes = 96L * 1024 * 1024;
     private bool drainingFrameSetupQueue;
     private bool frameSetupQueueStopping;
     private int activeFrameSetupWorkers;
@@ -261,6 +271,9 @@ public sealed class MainForm : Form
     private bool applyingZoomPreference;
     private string pendingSuggestionInput = string.Empty;
     private string lastAddressSuggestionInput = string.Empty;
+    private bool isAutocompletingAddressBar;
+    private bool suppressAddressBarAutocomplete;
+    private CancellationTokenSource? liveSuggestionCts;
     private Control? suggestionAnchor;
     private readonly string? startupAddress;
     private IReadOnlyList<StartPageLink>? cachedStartPageLinks;
@@ -323,7 +336,10 @@ public sealed class MainForm : Form
         darkModeEnabled = state.DarkModeEnabled;
         adBlockEnabled = state.AdBlockEnabled;
 
-        Text = isPrivateMode ? "Private \u2014 MishaWeb" : "MishaWeb";
+        incognitoBadge = new IncognitoBadgeControl(toolTip);
+        incognitoBadge.Click += (_, _) => ShowTransientStatus("Incognito mode: browsing history and data will not be saved");
+
+        Text = isPrivateMode ? "Incognito \u2014 MishaWeb" : "MishaWeb";
         StartPosition = FormStartPosition.Manual;
         var workingArea = Screen.FromPoint(Cursor.Position).WorkingArea;
         MinimumSize = new Size(
@@ -660,6 +676,10 @@ public sealed class MainForm : Form
         UpdateChromeRowsForFullscreen();
         UpdateFindBarLayout();
         ResizeTabHeaders();
+        if (addressSuggestionPopup.Visible)
+        {
+            PositionAddressSuggestions();
+        }
         omniboxPanel.Invalidate();
     }
 
@@ -671,6 +691,7 @@ public sealed class MainForm : Form
 
     protected override void WndProc(ref Message message)
     {
+        TrackPotentialUserInteraction(message.Msg);
         if (message.Msg == NativeMethods.WmNcActivate && WindowState != FormWindowState.Minimized)
         {
             // Keep DefWindowProc's activation bookkeeping without letting it paint
@@ -780,6 +801,45 @@ public sealed class MainForm : Form
         base.WndProc(ref message);
     }
 
+    private void TrackPotentialUserInteraction(int msg)
+    {
+        if (msg is NativeMethods.WmMouseMove or NativeMethods.WmNcMouseMove
+            or NativeMethods.WmNcLeftButtonDown or NativeMethods.WmNcLeftButtonUp
+            or NativeMethods.WmLeftButtonUp
+            or 0x0201 /* WM_LBUTTONDOWN */ or 0x0204 /* WM_RBUTTONDOWN */ or 0x0205 /* WM_RBUTTONUP */
+            or 0x020A /* WM_MOUSEWHEEL */
+            or 0x0100 /* WM_KEYDOWN */ or 0x0104 /* WM_SYSKEYDOWN */
+            or 0x0006 /* WM_ACTIVATE */)
+        {
+            NoteUserInteraction();
+        }
+    }
+
+    private void NoteUserInteraction()
+    {
+        lastUserInteractionUtc = DateTime.UtcNow;
+        if (isAppIdleLowPowerActive)
+        {
+            isAppIdleLowPowerActive = false;
+            if (activeTab is not null && !isWindowMinimized)
+            {
+                ApplyLiveTabMemoryTarget(activeTab, foreground: true);
+            }
+        }
+    }
+
+    private void CheckApplicationInactivity()
+    {
+        if (isClosing || isWindowMinimized || activeTab is null) return;
+        var idleDuration = DateTime.UtcNow - lastUserInteractionUtc;
+        if (idleDuration >= TimeSpan.FromMinutes(AppIdleThresholdMinutes) && !isAppIdleLowPowerActive)
+        {
+            isAppIdleLowPowerActive = true;
+            ApplyLiveTabMemoryTarget(activeTab, foreground: false);
+            TrimAllProcessMemory();
+        }
+    }
+
     private int GetResizeHitTest(Point point)
     {
         var frameX = NativeMethods.GetResizeFrameThickness(DeviceDpi, horizontal: true);
@@ -871,7 +931,12 @@ public sealed class MainForm : Form
 
     internal static ChromeColorPolicy ResolveChromeColorPolicyForTesting(bool highContrast)
     {
-        return ResolveChromeColorPolicy(highContrast);
+        return ResolveChromeColorPolicy(highContrast, isPrivateMode: false);
+    }
+
+    internal static ChromeColorPolicy ResolveChromeColorPolicyForTesting(bool highContrast, bool isPrivateMode)
+    {
+        return ResolveChromeColorPolicy(highContrast, isPrivateMode);
     }
 
     internal void ApplyHighContrastChromeForTesting(bool enabled)
@@ -897,7 +962,7 @@ public sealed class MainForm : Form
             menuRenderer.HighContrast);
     }
 
-    private static ChromeColorPolicy ResolveChromeColorPolicy(bool highContrast)
+    private static ChromeColorPolicy ResolveChromeColorPolicy(bool highContrast, bool isPrivateMode = false)
     {
         if (highContrast)
         {
@@ -923,6 +988,32 @@ public sealed class MainForm : Form
                 SystemColors.MenuText,
                 SystemColors.WindowText,
                 SystemColors.WindowText);
+        }
+
+        if (isPrivateMode)
+        {
+            return new ChromeColorPolicy(
+                false,
+                Color.FromArgb(34, 10, 32),
+                Color.FromArgb(24, 11, 25),
+                Color.FromArgb(30, 13, 33),
+                Color.FromArgb(18, 9, 20),
+                Color.FromArgb(20, 10, 22),
+                NativeUiTheme.Text,
+                NativeUiTheme.Text,
+                Color.FromArgb(185, 155, 195),
+                Color.FromArgb(98, 55, 112),
+                NativeUiTheme.Lavender,
+                Color.FromArgb(64, 25, 78),
+                NativeUiTheme.Text,
+                Color.FromArgb(50, 22, 58),
+                Color.FromArgb(62, 28, 72),
+                Color.FromArgb(38, 16, 44),
+                Color.FromArgb(48, 20, 56),
+                Color.FromArgb(30, 13, 33),
+                NativeUiTheme.Text,
+                Color.FromArgb(100, 48, 118),
+                NativeUiTheme.Text);
         }
 
         return new ChromeColorPolicy(
@@ -953,20 +1044,20 @@ public sealed class MainForm : Form
     {
         if (IsDisposed) return;
 
-        var palette = ResolveChromeColorPolicy(IsHighContrastActive);
+        var palette = ResolveChromeColorPolicy(IsHighContrastActive, isPrivateMode);
         BackColor = palette.Frame;
         rootLayout.BackColor = palette.ChromeSurface;
         titleBar.BackColor = palette.ChromeSurface;
         tabArea.BackColor = palette.ChromeSurface;
         tabStrip.BackColor = palette.ChromeSurface;
-        tabDropIndicator.BackColor = palette.HighContrast ? palette.Focus : AccentColor;
+        tabDropIndicator.BackColor = palette.HighContrast ? palette.Focus : (isPrivateMode ? NativeUiTheme.Lavender : AccentColor);
         tabDragGhost.HighContrast = palette.HighContrast;
         toolbar.BackColor = palette.ToolbarSurface;
         findBar.BackColor = palette.ToolbarSurface;
         TrySetBackColor(pageHost, Color.Transparent, palette.ChromeSurface);
 
         appMark.BackColor = palette.ChromeSurface;
-        appMark.ForeColor = palette.HighContrast ? palette.ChromeText : AccentColor;
+        appMark.ForeColor = palette.HighContrast ? palette.ChromeText : (isPrivateMode ? NativeUiTheme.Lavender : AccentColor);
         ApplyButtonPalette(newTabButton, palette.ChromeSurface, palette.ChromeText, palette, titleButton: true);
         ApplyButtonPalette(tabListButton, palette.ChromeSurface, palette.ChromeText, palette, titleButton: true);
         ApplyButtonPalette(minimizeButton, palette.ChromeSurface, palette.ChromeText, palette, titleButton: true);
@@ -1145,6 +1236,7 @@ public sealed class MainForm : Form
         pageHost.Dock = DockStyle.Fill;
         pageHost.Margin = Padding.Empty;
         TrySetBackColor(pageHost, Color.Transparent, ChromeColor);
+        pageHost.Resize += (_, _) => EnsureTabHostLayout(activeTab);
 
         rootLayout.Controls.Add(titleBar, 0, 0);
         rootLayout.Controls.Add(toolbar, 0, 1);
@@ -1174,7 +1266,7 @@ public sealed class MainForm : Form
         titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 34));
         titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 32));
-        titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 4));
+        titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, isPrivateMode ? 86 : 4));
         titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));
         titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));
         titleBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));
@@ -1188,7 +1280,12 @@ public sealed class MainForm : Form
         appMark.Font = new Font("Segoe UI Semibold", 10f);
         appMark.PrivateMode = isPrivateMode;
 
-        ConfigureTitleBarButton(newTabButton, "+", "New tab (Ctrl+T)", "New tab", 14f);
+        ConfigureTitleBarButton(
+            newTabButton,
+            "+",
+            isPrivateMode ? "New incognito tab (Ctrl+T)" : "New tab (Ctrl+T)",
+            isPrivateMode ? "New incognito tab" : "New tab",
+            14f);
         newTabButton.Dock = DockStyle.None;
         newTabButton.Size = new Size(32, 32);
         ConfigureTitleBarButton(tabListButton, "\u2304", "All tabs", "All tabs", 11f);
@@ -1223,6 +1320,10 @@ public sealed class MainForm : Form
         titleBar.Controls.Add(appMark, 0, 0);
         titleBar.Controls.Add(tabArea, 1, 0);
         titleBar.Controls.Add(tabListButton, 2, 0);
+        if (isPrivateMode)
+        {
+            titleBar.Controls.Add(incognitoBadge, 3, 0);
+        }
         titleBar.Controls.Add(minimizeButton, 4, 0);
         titleBar.Controls.Add(maximizeButton, 5, 0);
         titleBar.Controls.Add(closeWindowButton, 6, 0);
@@ -1278,7 +1379,7 @@ public sealed class MainForm : Form
         addressBar.ForeColor = PageTextColor;
         addressBar.Font = new Font("Segoe UI", 10.5f);
         addressBar.MaxLength = BrowserPolicy.MaximumUrlLength;
-        addressBar.PlaceholderText = $"Search with {BrowserPolicy.GetSearchProviderName(searchProviderId)} or enter address";
+        addressBar.PlaceholderText = $"Search with {BrowserPolicy.GetSearchProviderName(searchProviderId)} or enter address{(isPrivateMode ? " in Incognito" : string.Empty)}";
         addressBar.AccessibleName = "Address and search bar";
         addressBar.AccessibleDescription = "Enter a website address or search terms";
         addressContextMenu.ShowImageMargin = false;
@@ -1440,7 +1541,7 @@ public sealed class MainForm : Form
 
         AddMenuItem(appMenu, "Command palette", "Ctrl+Shift+P", ShowCommandPalette);
         AddMenuItem(appMenu, "New tab", "Ctrl+T", () => RunUiTask(() => OpenNewTabAsync(StartPage.Url), "Could not open a tab"));
-        AddMenuItem(appMenu, "New private window", "Ctrl+Shift+N", OpenPrivateWindow);
+        AddMenuItem(appMenu, "New incognito window", "Ctrl+Shift+N", OpenPrivateWindow);
         AddMenuItem(appMenu, "Reopen closed tab", "Ctrl+Shift+T", () => RunUiTask(RestoreClosedTabAsync, "Could not restore the tab"));
         appMenu.Items.Add(new ToolStripSeparator());
         appMenu.Items.Add(favoritesMenu);
@@ -1555,7 +1656,19 @@ public sealed class MainForm : Form
                 SyncAddressBar();
             });
         };
-        addressBar.TextChanged += (_, _) => QueueAddressSuggestions();
+        addressBar.TextChanged += (_, _) =>
+        {
+            if (isAutocompletingAddressBar) return;
+            if (suppressAddressBarAutocomplete)
+            {
+                suppressAddressBarAutocomplete = false;
+            }
+            else
+            {
+                TryApplyAddressBarAutocomplete();
+            }
+            QueueAddressSuggestions();
+        };
         addressBar.KeyDown += AddressBarOnKeyDown;
         addressSuggestionPopup.SuggestionAccepted += AcceptAddressSuggestion;
         addressSuggestionPopup.SuggestionRemoved += RemoveAddressSuggestion;
@@ -1727,7 +1840,17 @@ public sealed class MainForm : Form
             && tab.ActiveDownloads == 0);
         if (!hasCandidates)
         {
-            memoryTimer.Stop();
+            var hasLiveWebViews = environment is not null && tabs.Any(tab => !tab.IsClosed && tab.Core is not null);
+            if (!hasLiveWebViews)
+            {
+                memoryTimer.Stop();
+                return;
+            }
+            if (memoryTimer.Interval != IdleMemoryMaintenanceIntervalMs)
+            {
+                memoryTimer.Interval = IdleMemoryMaintenanceIntervalMs;
+            }
+            if (!memoryTimer.Enabled) memoryTimer.Start();
             return;
         }
 
@@ -1986,11 +2109,15 @@ public sealed class MainForm : Form
         }
     }
 
-    internal static BrowserEnvironmentOptionsSnapshot GetEnvironmentOptionsSnapshotForTesting() =>
-        new(
-            EnableTrackingPrevention: true,
-            AreBrowserExtensionsEnabled: true,
-            ExclusiveUserDataFolderAccess: true);
+    internal static BrowserEnvironmentOptionsSnapshot GetEnvironmentOptionsSnapshotForTesting()
+    {
+        var options = CreateEnvironmentOptions();
+        return new(
+            EnableTrackingPrevention: options.EnableTrackingPrevention,
+            AreBrowserExtensionsEnabled: options.AreBrowserExtensionsEnabled,
+            ExclusiveUserDataFolderAccess: options.ExclusiveUserDataFolderAccess,
+            AdditionalBrowserArguments: options.AdditionalBrowserArguments);
+    }
 
     internal static BrowserControllerProfileSnapshot GetControllerProfileSnapshotForTesting(bool isPrivateMode) =>
         new(
@@ -2001,12 +2128,34 @@ public sealed class MainForm : Form
         !isPrivateMode
         && BrowserExtensions.IsChromeWebStoreOrigin(url);
 
-    private static CoreWebView2EnvironmentOptions CreateEnvironmentOptions() => new()
+    private static CoreWebView2EnvironmentOptions CreateEnvironmentOptions()
     {
-        EnableTrackingPrevention = true,
-        AreBrowserExtensionsEnabled = true,
-        ExclusiveUserDataFolderAccess = true
-    };
+        var extraArgs = Environment.GetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+        var baseArgs =
+            "--autoplay-policy=no-user-gesture-required "
+            + "--enable-gpu-rasterization "
+            + "--enable-zero-copy "
+            + "--enable-features=CanvasOopRasterization,ParallelDownloading "
+            + "--disable-features=BackForwardCache,SpareRendererForSitePerProcess,PeriodicBackgroundSync,AudioServiceOutOfProcess,AudioServiceSandbox "
+            + "--enable-quic "
+            + "--enable-hardware-overlays=single-fullscreen,single-on-top";
+
+        var mergedArgs = string.IsNullOrWhiteSpace(extraArgs)
+            ? baseArgs
+            : (extraArgs.Contains("--autoplay-policy", StringComparison.OrdinalIgnoreCase)
+                ? $"{baseArgs} {extraArgs}".Trim()
+                : $"--autoplay-policy=no-user-gesture-required {baseArgs} {extraArgs}".Trim());
+
+        Environment.SetEnvironmentVariable("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", mergedArgs);
+
+        return new()
+        {
+            EnableTrackingPrevention = true,
+            AreBrowserExtensionsEnabled = true,
+            ExclusiveUserDataFolderAccess = true,
+            AdditionalBrowserArguments = mergedArgs
+        };
+    }
 
     private static async Task<CoreWebView2Environment> CreateEnvironmentAsync()
     {
@@ -2245,6 +2394,10 @@ public sealed class MainForm : Form
             Margin = Padding.Empty,
             Visible = false
         };
+        if (pageHost.ClientSize.Width > 0 && pageHost.ClientSize.Height > 0)
+        {
+            host.Bounds = pageHost.ClientRectangle;
+        }
 
         var overlay = CreateTabOverlay(out var overlayTitle, out var overlayDetail, out var overlayAction);
         TrySetBackColor(overlay, Color.Transparent, pageHost.BackColor);
@@ -2257,7 +2410,7 @@ public sealed class MainForm : Form
         pageHost.Controls.Add(host);
         TrySetBackColor(host, Color.Transparent, pageHost.BackColor);
 
-        var header = new TabHeader(toolTip);
+        var header = new TabHeader(toolTip) { IsPrivateMode = isPrivateMode };
         var tab = new BrowserTab(
             host,
             header,
@@ -2269,7 +2422,7 @@ public sealed class MainForm : Form
         {
             CanScriptClose = canScriptClose,
             IsStartPage = isStartPage,
-            Title = isStartPage ? "New tab" : HostFromUrl(url),
+            Title = isStartPage ? (isPrivateMode ? "Incognito" : "New tab") : HostFromUrl(url),
             StatusText = isStartPage ? "Ready" : "Starting\u2026",
             ConnectionState = isStartPage ? ConnectionState.Local : ConnectionState.Unknown
         };
@@ -2294,10 +2447,14 @@ public sealed class MainForm : Form
                 tabStrip.ScrollControlIntoView(activeTab.Header);
             }
         };
-        overlayAction.Click += (_, _) =>
+        void TriggerTabRecovery()
         {
             if (tab.RetryAction is not null) RunUiTask(tab.RetryAction, "Recovery failed");
-        };
+        }
+        overlayAction.Click += (_, _) => TriggerTabRecovery();
+        overlay.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+        overlayTitle.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
+        overlayDetail.Click += (_, _) => { if (tab.IsDiscarded) TriggerTabRecovery(); };
         if (!isStartPage)
         {
             ShowTabOverlay(tab, "Starting\u2026", "Preparing the browser engine", null, null);
@@ -2322,13 +2479,60 @@ public sealed class MainForm : Form
         };
     }
 
+    private void EnsureTabHostLayout(BrowserTab? tab)
+    {
+        if (tab is null || tab.IsClosed || isClosing) return;
+        if (pageHost.ClientSize.Width <= 0 || pageHost.ClientSize.Height <= 0) return;
+
+        var targetBounds = pageHost.ClientRectangle;
+        if (tab.Host.Bounds != targetBounds)
+        {
+            tab.Host.Bounds = targetBounds;
+        }
+
+        var hostBounds = tab.Host.ClientRectangle;
+        if (hostBounds.Width <= 0 || hostBounds.Height <= 0) return;
+
+        if (tab.StartPageView is not null && tab.StartPageView.Visible)
+        {
+            if (tab.StartPageView.Bounds != hostBounds)
+            {
+                tab.StartPageView.Bounds = hostBounds;
+            }
+            tab.StartPageView.PerformLayout();
+        }
+
+        if (tab.View is not null && tab.View.Visible && tab.View.Bounds != hostBounds)
+        {
+            tab.View.Bounds = hostBounds;
+        }
+
+        if (tab.Overlay.Visible && tab.Overlay.Bounds != hostBounds)
+        {
+            tab.Overlay.Bounds = hostBounds;
+        }
+    }
+
     private WebView2 EnsureTabView(BrowserTab tab)
     {
         if (tab.View is not null) return tab.View;
 
         var view = CreateWebView();
+        if (tab.Host.ClientSize.Width > 0 && tab.Host.ClientSize.Height > 0)
+        {
+            view.Bounds = tab.Host.ClientRectangle;
+        }
         tab.View = view;
         view.KeyUp += (_, e) => HandleMruKeyUp(e);
+        view.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode == Keys.N && e.Control && e.Shift)
+            {
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                OpenPrivateWindow();
+            }
+        };
         tab.Host.Controls.Add(view);
         view.SendToBack();
         tab.Overlay.BringToFront();
@@ -2340,7 +2544,11 @@ public sealed class MainForm : Form
     {
         if (tab.StartPageView is not null) return tab.StartPageView;
 
-        var startPageView = new NativeStartPage { Visible = false };
+        var startPageView = new NativeStartPage { Visible = false, Dock = DockStyle.Fill };
+        if (tab.Host.ClientSize.Width > 0 && tab.Host.ClientSize.Height > 0)
+        {
+            startPageView.Bounds = tab.Host.ClientRectangle;
+        }
         startPageView.SetSearchProvider(searchProviderId);
         startPageView.SetPrivateMode(isPrivateMode);
         void QueueOmniboxFocus()
@@ -2569,6 +2777,10 @@ public sealed class MainForm : Form
                 if (tab.Core is null) tab.IsInitializing = false;
             }
             ReleaseBrowserEnvironmentIfIdle();
+            if (activeTab == tab && tab.IsDiscarded && !tab.IsClosed && !isClosing)
+            {
+                RunUiTask(() => RestoreDiscardedTabAsync(tab, focusPage: true), "Could not restore the active tab");
+            }
         }
     }
 
@@ -2639,7 +2851,7 @@ public sealed class MainForm : Form
             || tab.NavigationRequestId != expectedNavigationRequestId
             || tab.IsStartPage
             || IsBackgroundProtected(tab)
-            || tab.RetryAction is not null
+            || (!tab.IsDiscarded && tab.RetryAction is not null)
             || (tab.IsDiscarded && tab.StatusText == "Unloaded to save memory"))
         {
             return;
@@ -2647,6 +2859,10 @@ public sealed class MainForm : Form
 
         if (tab.View is not null) ReplaceTabView(tab);
         MarkTabDiscarded(tab, "Waiting in the background");
+        if (activeTab == tab && !isClosing && !tab.IsClosed)
+        {
+            RunUiTask(() => RestoreDiscardedTabAsync(tab, focusPage: true), "Could not restore the active tab");
+        }
     }
 
     private void ReleaseAbandonedInitialization(
@@ -2656,7 +2872,7 @@ public sealed class MainForm : Form
     {
         if (tab.IsClosed || tab.View != initializingView) return;
 
-        var hasRecoveryAction = tab.RetryAction is not null;
+        var hasRecoveryAction = !tab.IsDiscarded && tab.RetryAction is not null;
         ReplaceTabView(tab);
         if (retainDiscardedShell
             && !hasRecoveryAction
@@ -2664,6 +2880,10 @@ public sealed class MainForm : Form
             && !tab.IsClosed)
         {
             MarkTabDiscarded(tab, "Waiting in the background");
+            if (activeTab == tab && !isClosing && !tab.IsClosed)
+            {
+                RunUiTask(() => RestoreDiscardedTabAsync(tab, focusPage: true), "Could not restore the active tab");
+            }
         }
     }
 
@@ -2701,11 +2921,21 @@ public sealed class MainForm : Form
                 tab.ZoomFactor = Math.Clamp(view.ZoomFactor, BrowserStateStore.MinimumSiteZoom, BrowserStateStore.MaximumSiteZoom);
                 if (!applyingZoomPreference) SaveSiteZoomPreference(tab);
             });
-        // Balanced retains WebView2 tracking protection without the known site
-        // breakage of Strict. The native shield continues to block its audited
-        // network and cosmetic rules independently.
-        core.Profile.PreferredTrackingPreventionLevel = CoreWebView2TrackingPreventionLevel.Balanced;
+        // None avoids WebView2's built-in tracking prevention from partitioning
+        // IndexedDB, WebCrypto, and WebSockets across communication domains
+        // (such as Messenger / Facebook). The native shield continues to block
+        // its audited network and cosmetic rules independently.
+        core.Profile.PreferredTrackingPreventionLevel = CoreWebView2TrackingPreventionLevel.None;
         await ApplyWebsiteThemeAsync(tab);
+        try
+        {
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(
+                BrowserPerformance.SiteResponsivenessDocumentScript);
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not install the site responsiveness script", error);
+        }
 
         if (adBlockEnabled && !tab.DeferResourceFilteringUntilPopupAttached)
         {
@@ -3357,12 +3587,12 @@ public sealed class MainForm : Form
         var topLevelUrl = tab.Core?.Source ?? tab.Url;
         var documentSource = (e.RequestedSourceKind & DocumentRequestSources) != 0;
         var workerSource = (e.RequestedSourceKind & WorkerRequestSources) != 0;
-        if (IsExceptionHost(HostFromUrl(e.Request.Uri))
-            || (documentSource && IsExceptionHost(HostFromUrl(topLevelUrl)))
-            || IsExceptionHost(HostFromUrl(sourceUrl))) return;
-        var contextName = e.ResourceContext.ToString();
-        var resourceType = AdBlockEngine.MapResourceType(
-            contextName,
+        if (adBlockExceptionHosts.Count > 0
+            && (IsExceptionHost(HostFromUrl(e.Request.Uri))
+                || (documentSource && IsExceptionHost(HostFromUrl(topLevelUrl)))
+                || IsExceptionHost(HostFromUrl(sourceUrl)))) return;
+        var resourceType = MapResourceType(
+            e.ResourceContext,
             e.ResourceContext == CoreWebView2WebResourceContext.Document
                 ? GetRequestHeader(e.Request.Headers, "Sec-Fetch-Dest")
                 : null);
@@ -3371,7 +3601,8 @@ public sealed class MainForm : Form
         // here produce the exact black/error player which a reload may hide.
         // Keep the narrow player bootstrap and videoplayback transport alive;
         // ad response pruning and player-side skip logic still handle ads.
-        if (ShouldBypassYouTubePlaybackRequest(topLevelUrl, e.Request.Uri, resourceType)) return;
+        if (ShouldBypassYouTubePlaybackRequest(topLevelUrl, sourceUrl, e.Request.Uri, resourceType)) return;
+        if (ShouldBypassCommunicationRequest(topLevelUrl, sourceUrl, e.Request.Uri, resourceType, workerSource)) return;
         if (resourceType is AdBlockResourceType.WebSocket or AdBlockResourceType.Media)
         {
             var topLevelOrigin = NormalizePermissionOrigin(topLevelUrl);
@@ -3408,7 +3639,7 @@ public sealed class MainForm : Form
                 resourceType,
                 cacheEvaluation: !isPrivateMode)) return;
 
-        e.Response = CreateBlockedResourceResponse(resourceType);
+        e.Response = CreateBlockedResourceResponse(resourceType, e.Request.Uri, topLevelUrl, e.Request.Headers);
         tab.BlockedRequestCount++;
         if (tab.BlockedRequestCount == 1) ShowTransientStatus("Shield blocked ad and tracker requests");
         else if (activeTab == tab && !statusUiTimer.Enabled) statusUiTimer.Start();
@@ -3425,6 +3656,7 @@ public sealed class MainForm : Form
         {
             try
             {
+                if (!headers.Contains(name)) continue;
                 var value = headers.GetHeader(name);
                 if (BrowserPolicy.IsHttpUrl(value))
                 {
@@ -3449,9 +3681,39 @@ public sealed class MainForm : Form
         CoreWebView2HttpRequestHeaders headers,
         string name)
     {
-        try { return headers.GetHeader(name); }
+        try
+        {
+            if (!headers.Contains(name)) return null;
+            return headers.GetHeader(name);
+        }
         catch (ArgumentException) { return null; }
         catch (COMException) { return null; }
+    }
+
+    private static AdBlockResourceType MapResourceType(
+        CoreWebView2WebResourceContext webViewContext,
+        string? fetchDestination = null)
+    {
+        return webViewContext switch
+        {
+            CoreWebView2WebResourceContext.Document when fetchDestination is not null
+                && (fetchDestination.Equals("iframe", StringComparison.OrdinalIgnoreCase)
+                    || fetchDestination.Equals("frame", StringComparison.OrdinalIgnoreCase)) =>
+                AdBlockResourceType.SubDocument,
+            CoreWebView2WebResourceContext.Document => AdBlockResourceType.Document,
+            CoreWebView2WebResourceContext.Stylesheet => AdBlockResourceType.Stylesheet,
+            CoreWebView2WebResourceContext.Image => AdBlockResourceType.Image,
+            CoreWebView2WebResourceContext.Media => AdBlockResourceType.Media,
+            CoreWebView2WebResourceContext.Font => AdBlockResourceType.Font,
+            CoreWebView2WebResourceContext.Script => AdBlockResourceType.Script,
+            CoreWebView2WebResourceContext.XmlHttpRequest => AdBlockResourceType.XmlHttpRequest,
+            CoreWebView2WebResourceContext.Fetch => AdBlockResourceType.Fetch,
+            CoreWebView2WebResourceContext.Websocket => AdBlockResourceType.WebSocket,
+            CoreWebView2WebResourceContext.Ping or CoreWebView2WebResourceContext.CspViolationReport => AdBlockResourceType.Ping,
+            CoreWebView2WebResourceContext.EventSource => AdBlockResourceType.XmlHttpRequest,
+            CoreWebView2WebResourceContext.TextTrack => AdBlockResourceType.Media,
+            _ => AdBlockResourceType.Other
+        };
     }
 
     internal static bool ShouldBypassUnknownWorkerRequest(
@@ -3472,45 +3734,187 @@ public sealed class MainForm : Form
 
     internal static bool ShouldBypassYouTubePlaybackRequest(
         string? topLevelUrl,
+        string? sourceUrl,
         string? requestUrl,
         AdBlockResourceType resourceType)
     {
-        if (!Uri.TryCreate(topLevelUrl, UriKind.Absolute, out var topLevel)
-            || !Uri.TryCreate(requestUrl, UriKind.Absolute, out var request)
-            || !IsYouTubeHost(topLevel.Host)
-            || !topLevel.AbsolutePath.Equals("/watch", StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(requestUrl))
+        {
+            return false;
+        }
+
+        if (!Uri.TryCreate(requestUrl, UriKind.Absolute, out var request))
+        {
+            return false;
+        }
+
+        // 1. Any request to *.googlevideo.com is Google's video/audio streaming CDN.
+        // It NEVER serves standalone display ads or third-party trackers.
+        // Blocking it at the network level causes 0:00/0:00 black-screen player stalls.
+        var isGooglevideoHost = request.Host.Equals("googlevideo.com", StringComparison.OrdinalIgnoreCase)
+            || request.Host.EndsWith(".googlevideo.com", StringComparison.OrdinalIgnoreCase);
+        if (isGooglevideoHost)
+        {
+            return true;
+        }
+
+        // 2. YouTube player API and video info endpoints must be bypassed regardless
+        // of whether topLevelUrl or sourceUrl represents the YouTube page.
+        var isYouTubeRequest = IsYouTubeHost(request.Host);
+        if (!isYouTubeRequest)
         {
             return false;
         }
 
         var path = request.AbsolutePath;
-        var isPlayerBootstrap = IsYouTubeHost(request.Host)
-            && (path.Equals("/youtubei/v1/player", StringComparison.OrdinalIgnoreCase)
-                || path.Equals("/get_video_info", StringComparison.OrdinalIgnoreCase));
-        if (isPlayerBootstrap)
+        var isPlayerEndpoint = path.Equals("/youtubei/v1/player", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/get_watch", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/next", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/browse", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/search", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/reel/reel_item_watch", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/reel/reel_watch_sequence", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/youtubei/v1/att/get", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("/get_video_info", StringComparison.OrdinalIgnoreCase);
+
+        if (isPlayerEndpoint)
         {
             return resourceType is AdBlockResourceType.XmlHttpRequest
                 or AdBlockResourceType.Fetch
                 or AdBlockResourceType.Other;
         }
 
-        var isPlaybackHost = request.Host.Equals("googlevideo.com", StringComparison.OrdinalIgnoreCase)
-            || request.Host.EndsWith(".googlevideo.com", StringComparison.OrdinalIgnoreCase);
-        return isPlaybackHost
-            && path.Equals("/videoplayback", StringComparison.OrdinalIgnoreCase)
-            && (resourceType is AdBlockResourceType.Media
+        var topLevelIsYouTube = !string.IsNullOrWhiteSpace(topLevelUrl)
+            && Uri.TryCreate(topLevelUrl, UriKind.Absolute, out var topUri)
+            && IsYouTubeHost(topUri.Host);
+        var sourceIsYouTube = !string.IsNullOrWhiteSpace(sourceUrl)
+            && Uri.TryCreate(sourceUrl, UriKind.Absolute, out var srcUri)
+            && IsYouTubeHost(srcUri.Host);
+
+        if (topLevelIsYouTube || sourceIsYouTube)
+        {
+            if (resourceType is AdBlockResourceType.Media)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static bool ShouldBypassCommunicationRequest(
+        string? topLevelUrl,
+        string? sourceUrl,
+        string? requestUrl,
+        AdBlockResourceType resourceType,
+        bool workerSource)
+    {
+        if (resourceType is not (AdBlockResourceType.WebSocket
+                or AdBlockResourceType.Media
                 or AdBlockResourceType.XmlHttpRequest
                 or AdBlockResourceType.Fetch
-                or AdBlockResourceType.Other);
+                or AdBlockResourceType.Script
+                or AdBlockResourceType.Ping
+                or AdBlockResourceType.Other))
+        {
+            return false;
+        }
+
+        var targetUrl = !string.IsNullOrEmpty(topLevelUrl) && !topLevelUrl.Equals("about:blank", StringComparison.OrdinalIgnoreCase)
+            ? topLevelUrl
+            : sourceUrl;
+
+        if (CommunicationCompatibilityPolicy.ShouldBypassCommunicationRequest(targetUrl, requestUrl, resourceType))
+        {
+            return true;
+        }
+
+        if (workerSource && Uri.TryCreate(requestUrl, UriKind.Absolute, out var reqUri))
+        {
+            if (CommunicationCompatibilityPolicy.IsProviderTransportHost(reqUri.IdnHost))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool IsYouTubeHost(string host) =>
         host.Equals("youtube.com", StringComparison.OrdinalIgnoreCase)
         || host.EndsWith(".youtube.com", StringComparison.OrdinalIgnoreCase);
 
-    private CoreWebView2WebResourceResponse? CreateBlockedResourceResponse(AdBlockResourceType resourceType)
+    private CoreWebView2WebResourceResponse? CreateBlockedResourceResponse(
+        AdBlockResourceType resourceType,
+        string? requestUrl = null,
+        string? topLevelUrl = null,
+        CoreWebView2HttpRequestHeaders? requestHeaders = null)
     {
         if (environment is null) return null;
+        var isYouTubeContext = (topLevelUrl is not null && topLevelUrl.Contains("youtube.com", StringComparison.OrdinalIgnoreCase))
+            || (requestUrl is not null && (requestUrl.Contains("youtube.com", StringComparison.OrdinalIgnoreCase)
+                || requestUrl.Contains("doubleclick.net", StringComparison.OrdinalIgnoreCase)
+                || requestUrl.Contains("googleads", StringComparison.OrdinalIgnoreCase)
+                || requestUrl.Contains("googlesyndication", StringComparison.OrdinalIgnoreCase)));
+
+        if (isYouTubeContext)
+        {
+            var origin = "https://www.youtube.com";
+            if (requestHeaders is not null && requestHeaders.Contains("Origin"))
+            {
+                try
+                {
+                    var headerOrigin = requestHeaders.GetHeader("Origin");
+                    if (!string.IsNullOrWhiteSpace(headerOrigin) && headerOrigin != "null")
+                    {
+                        origin = headerOrigin;
+                    }
+                }
+                catch { }
+            }
+            else if (!string.IsNullOrEmpty(topLevelUrl) && Uri.TryCreate(topLevelUrl, UriKind.Absolute, out var topUri))
+            {
+                origin = topUri.GetLeftPart(UriPartial.Authority);
+            }
+
+            if (requestUrl is not null && requestUrl.Contains("/pagead/id", StringComparison.OrdinalIgnoreCase))
+            {
+                var idPayload = ")]}'\n\n{\"id\":\"ANyPxKrAzkV5cLEVtGXqf11mX0EFDh00ASxA-CsrWnAIiEOXKju9lnsjfHFdvqf7wl5Er6SrJEF7\",\"type\":4}"u8.ToArray();
+                return environment.CreateWebResourceResponse(
+                    new MemoryStream(idPayload, writable: false),
+                    200,
+                    "OK",
+                    $"Content-Type: application/json; charset=ISO-8859-1\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: *\r\nVary: Origin");
+            }
+
+            if (resourceType is AdBlockResourceType.XmlHttpRequest or AdBlockResourceType.Fetch)
+            {
+                return environment.CreateWebResourceResponse(
+                    new MemoryStream("{}"u8.ToArray(), writable: false),
+                    200,
+                    "OK",
+                    $"Content-Type: application/json; charset=utf-8\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: *\r\nVary: Origin");
+            }
+
+            if (resourceType is AdBlockResourceType.Script)
+            {
+                return environment.CreateWebResourceResponse(
+                    new MemoryStream(YouTubeScriptStubBytes, writable: false),
+                    200,
+                    "OK",
+                    "Content-Type: application/javascript; charset=utf-8\r\nAccess-Control-Allow-Origin: *");
+            }
+
+            if (resourceType is AdBlockResourceType.Ping or AdBlockResourceType.Other)
+            {
+                return environment.CreateWebResourceResponse(
+                    Stream.Null,
+                    204,
+                    "No Content",
+                    $"Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: *\r\nVary: Origin");
+            }
+        }
+
         return resourceType switch
         {
             AdBlockResourceType.Script => environment.CreateWebResourceResponse(
@@ -3990,7 +4394,7 @@ public sealed class MainForm : Form
 
     private void OnDocumentTitleChanged(BrowserTab tab)
     {
-        var title = tab.IsStartPage ? "New tab" : tab.Core!.DocumentTitle;
+        var title = tab.IsStartPage ? (isPrivateMode ? "Incognito" : "New tab") : tab.Core!.DocumentTitle;
         var sanitizedTitle = BrowserStateStore.SanitizeTitle(title);
         tab.Title = sanitizedTitle.Length == 0 ? HostFromUrl(tab.Url) : sanitizedTitle;
         UpdateTabHeader(tab);
@@ -4849,7 +5253,7 @@ public sealed class MainForm : Form
         tab.IsStartPage = true;
         tab.IsDiscarded = false;
         tab.Url = StartPage.Url;
-        tab.Title = "New tab";
+        tab.Title = isPrivateMode ? "Incognito" : "New tab";
         tab.StatusText = "Ready";
         tab.ConnectionState = ConnectionState.Local;
         tab.BlockedRequestCount = 0;
@@ -4873,6 +5277,7 @@ public sealed class MainForm : Form
         startPageView.SetStatus(BuildStartPageStatus());
         startPageView.SetSearchProvider(searchProviderId);
         startPageView.SetPrivateMode(isPrivateMode);
+        EnsureTabHostLayout(tab);
         startPageView.Visible = true;
         startPageView.BringToFront();
     }
@@ -4952,6 +5357,7 @@ public sealed class MainForm : Form
         foreach (var tab in tabs.Where(item => item.IsStartPage && !item.IsClosed))
         {
             if (tab.StartPageView is null) continue;
+            tab.StartPageView.SetPrivateMode(isPrivateMode);
             tab.StartPageView.SetStatus(status);
             if (links is not null) tab.StartPageView.SetQuickLinks(links);
         }
@@ -5060,38 +5466,50 @@ public sealed class MainForm : Form
             tab.Host.Visible = true;
         }
         SyncDomFullScreenFromActiveTab();
-        if (previousTab is not null)
+        pageHost.SuspendLayout();
+        try
         {
-            previousTab.Host.Visible = false;
-            if (previousTab.View is not null) previousTab.View.Visible = false;
-            UpdateTabHeader(previousTab);
-        }
+            if (previousTab is not null)
+            {
+                previousTab.Host.Visible = false;
+                if (previousTab.View is not null) previousTab.View.Visible = false;
+                UpdateTabHeader(previousTab);
+            }
 
-        if (!preserveBackdropFrame) tab.Host.Visible = true;
-        if (tab.View is not null)
-        {
-            tab.View.Visible = !isWindowMinimized
-                && !tab.Overlay.Visible
-                && tab.StartPageView?.Visible != true;
-        }
-        UpdateTabHeader(tab);
-        if (tabStrip.AutoScrollMinSize.Width > tabStrip.ClientSize.Width)
-        {
-            tabStrip.ScrollControlIntoView(tab.Header);
-        }
+            if (!preserveBackdropFrame) tab.Host.Visible = true;
+            if (tab.View is not null)
+            {
+                tab.View.Visible = !isWindowMinimized
+                    && !tab.Overlay.Visible
+                    && tab.StartPageView?.Visible != true;
+            }
+            UpdateTabHeader(tab);
+            if (tabStrip.AutoScrollMinSize.Width > tabStrip.ClientSize.Width)
+            {
+                tabStrip.ScrollControlIntoView(tab.Header);
+            }
 
-        tab.Host.BringToFront();
-        if (tab.Overlay.Visible)
-        {
-            tab.Overlay.BringToFront();
+            tab.Host.BringToFront();
+            if (tab.Overlay.Visible)
+            {
+                tab.Overlay.BringToFront();
+            }
+            else if (tab.StartPageView?.Visible == true)
+            {
+                tab.StartPageView.BringToFront();
+            }
+            else
+            {
+                tab.View?.BringToFront();
+            }
+
+            EnsureTabHostLayout(tab);
         }
-        else if (tab.StartPageView?.Visible == true)
+        finally
         {
-            tab.StartPageView.BringToFront();
-        }
-        else
-        {
-            tab.View?.BringToFront();
+            pageHost.ResumeLayout(true);
+            pageHost.PerformLayout();
+            EnsureTabHostLayout(tab);
         }
         tab.LastActiveUtc = DateTime.UtcNow;
         tab.ConsecutiveSuspendFailures = 0;
@@ -5178,11 +5596,17 @@ public sealed class MainForm : Form
         tab.IsLoading = false;
         tab.ReaderModeActive = false;
         tab.StatusText = "Unloaded to save memory";
-        ShowTabOverlay(tab, "Tab unloaded", $"{detail}. It will reload when selected.", null, null);
+        ShowTabOverlay(
+            tab,
+            "Tab unloaded",
+            $"{detail}. It will reload when selected.",
+            "Reload tab",
+            () => RestoreDiscardedTabAsync(tab, focusPage: true));
         UpdateTabHeader(tab);
         if (!restoringSession)
         {
             RefreshNativeStartPages();
+            TrimAllProcessMemory();
             RefreshMemorySweepTimer();
         }
     }
@@ -5286,7 +5710,16 @@ public sealed class MainForm : Form
         ReleaseBrowserEnvironmentIfIdle();
         RefreshNativeStartPages();
         ResizeTabHeaders();
+        TrimAllProcessMemory();
         RefreshMemorySweepTimer();
+        RunUiTask(
+            async () =>
+            {
+                await Task.Delay(350);
+                if (isClosing) return;
+                TrimAllProcessMemory();
+            },
+            "Could not complete post-close memory trimming");
 
         if (isClosing || replacingWindow) return;
         if (tabs.Count == 0)
@@ -5367,19 +5800,49 @@ public sealed class MainForm : Form
 
         ApplyLiveTabMemoryTarget(tab, foreground: false);
         RefreshMemorySweepTimer();
-        if (requestedMode != TabLifecycleMode.Ultra) return;
         RunUiTask(
             async () =>
             {
+                await Task.Delay(2500);
+                if (isClosing || tab.IsClosed || (tab == activeTab && !isWindowMinimized)) return;
+                CompactBackgroundTabMemory(tab);
+
                 var mode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
                 if (mode != TabLifecycleMode.Ultra) return;
+                await Task.Delay(2500);
+                if (isClosing || tab.IsClosed || (tab == activeTab && !isWindowMinimized)) return;
+                var currentMode = TabLifecyclePolicy.ResolveMode(memorySaverEnabled, ultraLightEnabled);
+                if (currentMode != TabLifecycleMode.Ultra) return;
                 var suspended = await TrySuspendTabAsync(
                     tab,
                     includeActiveTab: isWindowMinimized && tab == activeTab,
-                    expectedMode: mode);
+                    expectedMode: currentMode);
                 if (!suspended) TryDiscardTabAfterFailedSuspend(tab);
             },
             "Could not rest a background tab");
+    }
+
+    private void CompactBackgroundTabMemory(BrowserTab tab)
+    {
+        if (isClosing
+            || tab.IsClosed
+            || tab.IsLoading
+            || tab.IsInitializing
+            || IsBackgroundProtected(tab)
+            || (tab == activeTab && !isWindowMinimized))
+        {
+            return;
+        }
+
+        if (!IsTabAudible(tab) && tab.ActiveDownloads == 0 && tab.Core is { } core)
+        {
+            try
+            {
+                _ = core.ExecuteScriptAsync("try { window.gc && window.gc(); } catch (_) {}");
+            }
+            catch { }
+        }
+        SystemResourceInfo.TrimCurrentProcessWorkingSet();
     }
 
     private bool IsOrdinaryResidentCandidate(BrowserTab tab)
@@ -5543,6 +6006,7 @@ public sealed class MainForm : Form
         {
             return;
         }
+        CheckApplicationInactivity();
         if (DateTimeOffset.UtcNow < nextLifecycleScanAt) return;
         if (!tabs.Any(item =>
             (item.Core is not null || item.IsInitializing)
@@ -5560,7 +6024,8 @@ public sealed class MainForm : Form
             && item.ActiveDownloads == 0
             && !item.IsDiscarded))
         {
-            memoryTimer.Stop();
+            TrimAllProcessMemory();
+            RefreshMemorySweepTimer();
             nextLifecycleScanAt = DateTimeOffset.MinValue;
             return;
         }
@@ -5644,10 +6109,78 @@ public sealed class MainForm : Form
                 }
             }
             UpdateStatus();
+            TrimAllProcessMemory();
         }
         finally
         {
             memorySweepRunning = false;
+        }
+    }
+
+    private void TrimAllProcessMemory()
+    {
+        if (isClosing) return;
+        try
+        {
+            foreach (var tab in tabs)
+            {
+                if (!tab.IsClosed && tab.Core is { } core)
+                {
+                    try
+                    {
+                        _ = core.ExecuteScriptAsync("try { window.gc && window.gc(); } catch (_) {}");
+                    }
+                    catch
+                    {
+                        // Ignore COM or lifecycle errors
+                    }
+                }
+            }
+
+            GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
+            SystemResourceInfo.TrimCurrentProcessWorkingSet();
+            if (environment is not null)
+            {
+                try
+                {
+                    var processInfos = environment.GetProcessInfos();
+                    if (processInfos is not null)
+                    {
+                        foreach (var processInfo in processInfos)
+                        {
+                            SystemResourceInfo.TrimProcessWorkingSet(processInfo.ProcessId);
+                            if (processInfo.Kind == CoreWebView2ProcessKind.Renderer)
+                            {
+                                try
+                                {
+                                    using var proc = Process.GetProcessById(processInfo.ProcessId);
+                                    if (proc.PrivateMemorySize64 > MaxInactiveRendererPrivateBytes)
+                                    {
+                                        foreach (var tab in tabs)
+                                        {
+                                            if (!tab.IsClosed && tab.Core is { } core)
+                                            {
+                                                _ = core.ExecuteScriptAsync("try { window.gc && window.gc({type:'major',execution:'sync'}); } catch (_) {}");
+                                            }
+                                        }
+                                    }
+                                }
+                                catch
+                                {
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception error)
+                {
+                    stateStore.Log("Could not trim WebView2 child process memory", error);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            stateStore.Log("Could not trim process memory", error);
         }
     }
 
@@ -5823,12 +6356,24 @@ public sealed class MainForm : Form
 
     private static bool IsBackgroundProtected(BrowserTab tab)
     {
+        var effectiveUrl = tab.Core?.Source ?? tab.Url;
         return tab.PendingMediaPermissionRefreshes > 0
             || tab.PendingMediaPermissionRequests > 0
+            || CommunicationCompatibilityPolicy.IsCallSite(effectiveUrl)
+            || IsYouTubeWatchUrl(effectiveUrl)
             || CommunicationCompatibilityPolicy.ShouldProtectBackgroundTab(
                 tab.KeepAwake,
                 tab.MicrophoneAccessGranted,
                 tab.CameraAccessGranted);
+    }
+
+    private static bool IsYouTubeWatchUrl(string? url)
+    {
+        return !string.IsNullOrEmpty(url)
+            && Uri.TryCreate(url, UriKind.Absolute, out var uri)
+            && IsYouTubeHost(uri.Host)
+            && (uri.AbsolutePath.Equals("/watch", StringComparison.OrdinalIgnoreCase)
+                || uri.AbsolutePath.StartsWith("/shorts", StringComparison.OrdinalIgnoreCase));
     }
 
     private void ResumeTab(BrowserTab tab)
@@ -5840,7 +6385,7 @@ public sealed class MainForm : Form
         {
             core.Resume();
             tab.IsSuspended = false;
-            tab.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal;
+            SetTabMemoryTarget(tab, CoreWebView2MemoryUsageTargetLevel.Normal);
             RunUiTask(
                 () => ApplyWebsiteThemeAsync(tab),
                 "Could not refresh the website color preference after waking a tab");
@@ -5885,6 +6430,7 @@ public sealed class MainForm : Form
                     expectedMode: mode);
                 if (!suspended) TryDiscardTabAfterFailedSuspend(minimizingTab);
             }
+            TrimAllProcessMemory();
             RefreshMemorySweepTimer();
             return;
         }
@@ -7111,6 +7657,7 @@ public sealed class MainForm : Form
 
     private bool IsExceptionHost(string host)
     {
+        if (adBlockExceptionHosts.Count == 0) return false;
         var normalized = BrowserPolicy.NormalizeExactHost(host);
         return normalized is not null && adBlockExceptionHosts.Contains(normalized);
     }
@@ -7727,6 +8274,14 @@ public sealed class MainForm : Form
                 return;
             }
 
+            if (args.PermissionKind == CoreWebView2PermissionKind.Autoplay)
+            {
+                args.State = CoreWebView2PermissionState.Allow;
+                args.SavesInProfile = true;
+                deferral.Complete();
+                return;
+            }
+
             if (IsMediaCapturePermission(args.PermissionKind))
             {
                 if (tab.PendingMediaPermissionRequests == 0)
@@ -8227,7 +8782,7 @@ public sealed class MainForm : Form
 
         var showAllActions = !string.IsNullOrWhiteSpace(query);
         yield return Action("New tab", "Open a blank start page", "new-tab", "Ctrl+T");
-        yield return Action("New private window", "Open a temporary private window", "private-window", "Ctrl+Shift+N");
+        yield return Action("New incognito window", "Open a temporary incognito window", "private-window", "Ctrl+Shift+N");
         yield return Action("Close tab", "Close the active tab", "close-tab", "Ctrl+W");
         yield return Action("Reopen tab", "Restore the newest recently closed tab", "reopen-tab", "Ctrl+Shift+T");
         yield return Action("Find on page", "Search text in the current page", "find", "Ctrl+F");
@@ -8885,7 +9440,7 @@ public sealed class MainForm : Form
                 var item = new ToolStripMenuItem(TrimMenuText(tab.Title, 42))
                 {
                     Checked = tab == activeTab,
-                    ToolTipText = tab.IsStartPage ? "New tab" : BuildTabDetail(tab),
+                    ToolTipText = tab.IsStartPage ? (isPrivateMode ? "Incognito" : "New tab") : BuildTabDetail(tab),
                     AccessibleName = $"{tab.Title} tab"
                 };
                 item.Click += (_, _) => ActivateTab(tab);
@@ -8905,6 +9460,74 @@ public sealed class MainForm : Form
         extensionsMenuItem.ToolTipText = isPrivateMode
             ? "Extensions are unavailable in private windows"
             : "Install and manage browser extensions";
+        extensionsMenuItem.DropDownItems.Clear();
+        var manageItem = new ToolStripMenuItem("Manage extensions…")
+        {
+            ToolTipText = "Open the extensions manager"
+        };
+        manageItem.Click += (_, _) => RunUiTask(
+            ShowExtensionsManagerAsync,
+            "Could not open the extensions manager");
+        extensionsMenuItem.DropDownItems.Add(manageItem);
+
+        if (!isPrivateMode)
+        {
+            var managed = browserExtensions.GetManagedExtensions();
+            if (managed.Count > 0)
+            {
+                extensionsMenuItem.DropDownItems.Add(new ToolStripSeparator());
+                foreach (var ext in managed.Values.OrderBy(e => e.Name, StringComparer.CurrentCultureIgnoreCase))
+                {
+                    Image? icon = null;
+                    if (ext.IconPath is not null)
+                    {
+                        var iconFullPath = Path.Combine(ext.FolderPath, ext.IconPath.Replace('/', Path.DirectorySeparatorChar));
+                        if (File.Exists(iconFullPath))
+                        {
+                            try { icon = Image.FromFile(iconFullPath); } catch { }
+                        }
+                    }
+                    var extItem = new ToolStripMenuItem(TrimMenuText(ext.Name, 42), icon);
+                    var hasPopup = ext.PopupPath is not null || ext.LaunchPath is not null;
+                    var hasOptions = ext.OptionsPath is not null;
+                    if (hasPopup && hasOptions)
+                    {
+                        var popupSub = new ToolStripMenuItem("Open popup", null, (_, _) =>
+                        {
+                            var target = ext.PopupPath ?? ext.LaunchPath!;
+                            RunUiTask(() => OpenNewTabAsync($"chrome-extension://{ext.Id}/{target}", trustedExtensionId: ext.Id), "Could not open extension popup");
+                        });
+                        var optionsSub = new ToolStripMenuItem("Options", null, (_, _) =>
+                        {
+                            RunUiTask(() => OpenNewTabAsync($"chrome-extension://{ext.Id}/{ext.OptionsPath}", trustedExtensionId: ext.Id), "Could not open extension options");
+                        });
+                        extItem.DropDownItems.Add(popupSub);
+                        extItem.DropDownItems.Add(optionsSub);
+                        extItem.Click += (_, _) =>
+                        {
+                            var target = ext.PopupPath ?? ext.LaunchPath!;
+                            RunUiTask(() => OpenNewTabAsync($"chrome-extension://{ext.Id}/{target}", trustedExtensionId: ext.Id), "Could not open extension");
+                        };
+                    }
+                    else if (hasPopup)
+                    {
+                        extItem.Click += (_, _) =>
+                        {
+                            var target = ext.PopupPath ?? ext.LaunchPath!;
+                            RunUiTask(() => OpenNewTabAsync($"chrome-extension://{ext.Id}/{target}", trustedExtensionId: ext.Id), "Could not open extension");
+                        };
+                    }
+                    else if (hasOptions)
+                    {
+                        extItem.Click += (_, _) =>
+                        {
+                            RunUiTask(() => OpenNewTabAsync($"chrome-extension://{ext.Id}/{ext.OptionsPath}", trustedExtensionId: ext.Id), "Could not open extension options");
+                        };
+                    }
+                    extensionsMenuItem.DropDownItems.Add(extItem);
+                }
+            }
+        }
         PopulateSearchProviderMenu();
         favoritesMenu.DropDownItems.Clear();
         if (state.Bookmarks.Count == 0)
@@ -9059,7 +9682,7 @@ public sealed class MainForm : Form
     {
         searchProviderId = BrowserPolicy.NormalizeSearchProviderId(providerId);
         state.SearchProviderId = searchProviderId;
-        addressBar.PlaceholderText = $"Search with {BrowserPolicy.GetSearchProviderName(searchProviderId)} or enter address";
+        addressBar.PlaceholderText = $"Search with {BrowserPolicy.GetSearchProviderName(searchProviderId)} or enter address{(isPrivateMode ? " in Incognito" : string.Empty)}";
         foreach (var tab in tabs.Where(item => item.StartPageView is not null && !item.IsClosed))
         {
             tab.StartPageView!.SetSearchProvider(searchProviderId);
@@ -9391,6 +10014,9 @@ public sealed class MainForm : Form
             .Select(extension =>
             {
                 managedExtensions.TryGetValue(extension.Id, out var managed);
+                var fullIconPath = managed?.FolderPath is not null && managed.IconPath is not null
+                    ? Path.Combine(managed.FolderPath, managed.IconPath.Replace('/', Path.DirectorySeparatorChar))
+                    : null;
                 return new ExtensionManagerRow(
                     extension.Id,
                     SanitizeExtensionDisplayName(extension.Name),
@@ -9399,7 +10025,14 @@ public sealed class MainForm : Form
                     managed?.LaunchPath,
                     managed?.StoreId is not null
                         && managed.StoreId.Equals(extension.Id, StringComparison.OrdinalIgnoreCase),
-                    extension);
+                    extension,
+                    managed?.PopupPath,
+                    managed?.OptionsPath,
+                    managed?.Description,
+                    fullIconPath,
+                    managed?.StoreId,
+                    managed?.FolderPath,
+                    managed?.RequestedCapabilities);
             })
             .ToArray();
     }
@@ -9878,7 +10511,9 @@ public sealed class MainForm : Form
             throw new InvalidOperationException("The selected extension is no longer available.");
         }
 
-        using var extensionMutation = action == ExtensionManagerAction.Open
+        using var extensionMutation = (action == ExtensionManagerAction.Open
+            || action == ExtensionManagerAction.OpenPopup
+            || action == ExtensionManagerAction.OpenOptions)
             ? null
             : BeginExtensionMutation();
         try
@@ -9886,11 +10521,24 @@ public sealed class MainForm : Form
             switch (action)
             {
                 case ExtensionManagerAction.Open:
-                    if (row.LaunchPath is null) return;
-                    var url = $"chrome-extension://{row.Id}/{row.LaunchPath}";
-                    if (await OpenNewTabAsync(url, trustedExtensionId: row.Id) is null)
+                case ExtensionManagerAction.OpenPopup:
+                    var popupTarget = (action == ExtensionManagerAction.OpenPopup ? row.PopupPath : null)
+                        ?? row.LaunchPath
+                        ?? row.OptionsPath;
+                    if (popupTarget is null) return;
+                    var popupUrl = $"chrome-extension://{row.Id}/{popupTarget}";
+                    if (await OpenNewTabAsync(popupUrl, trustedExtensionId: row.Id) is null)
                     {
                         throw new InvalidOperationException("The extension page could not be opened.");
+                    }
+                    break;
+                case ExtensionManagerAction.OpenOptions:
+                    var optionsTarget = row.OptionsPath ?? row.LaunchPath;
+                    if (optionsTarget is null) return;
+                    var optionsUrl = $"chrome-extension://{row.Id}/{optionsTarget}";
+                    if (await OpenNewTabAsync(optionsUrl, trustedExtensionId: row.Id) is null)
+                    {
+                        throw new InvalidOperationException("The extension options page could not be opened.");
                     }
                     break;
                 case ExtensionManagerAction.ToggleEnabled:
@@ -10381,7 +11029,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private void OpenPrivateWindow()
+    internal void OpenPrivateWindow()
     {
         if (isClosing) return;
         var privateWindow = new MainForm(true, null, null, BrowserMode.Private)
@@ -10391,7 +11039,7 @@ public sealed class MainForm : Form
         };
         Program.RegisterTopLevelWindow(privateWindow);
         privateWindow.Show();
-        ShowTransientStatus("Private window opened");
+        ShowTransientStatus("Incognito window opened");
     }
 
     private void ToggleReducedWebsiteMotion()
@@ -10542,6 +11190,64 @@ public sealed class MainForm : Form
 
     private void AddressBarOnKeyDown(object? sender, KeyEventArgs e)
     {
+        if (e.KeyCode == Keys.Back)
+        {
+            if (addressBar.SelectionLength > 0 && addressBar.SelectionStart + addressBar.SelectionLength == addressBar.TextLength)
+            {
+                var typedLength = addressBar.SelectionStart;
+                suppressAddressBarAutocomplete = true;
+                if (typedLength > 0)
+                {
+                    isAutocompletingAddressBar = true;
+                    try
+                    {
+                        addressBar.Text = addressBar.Text[..(typedLength - 1)];
+                        addressBar.SelectionStart = addressBar.TextLength;
+                        addressBar.SelectionLength = 0;
+                    }
+                    finally
+                    {
+                        isAutocompletingAddressBar = false;
+                    }
+                    e.SuppressKeyPress = true;
+                    QueueAddressSuggestions();
+                    return;
+                }
+            }
+            suppressAddressBarAutocomplete = true;
+        }
+        else if (e.KeyCode == Keys.Delete)
+        {
+            if (addressBar.SelectionLength > 0 && addressBar.SelectionStart + addressBar.SelectionLength == addressBar.TextLength)
+            {
+                isAutocompletingAddressBar = true;
+                try
+                {
+                    addressBar.Text = addressBar.Text[..addressBar.SelectionStart];
+                    addressBar.SelectionStart = addressBar.TextLength;
+                    addressBar.SelectionLength = 0;
+                }
+                finally
+                {
+                    isAutocompletingAddressBar = false;
+                }
+                suppressAddressBarAutocomplete = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+            suppressAddressBarAutocomplete = true;
+        }
+        else if (e.KeyCode is Keys.Right or Keys.Tab)
+        {
+            if (addressBar.SelectionLength > 0 && addressBar.SelectionStart + addressBar.SelectionLength == addressBar.TextLength)
+            {
+                addressBar.SelectionStart = addressBar.TextLength;
+                addressBar.SelectionLength = 0;
+                e.SuppressKeyPress = true;
+                return;
+            }
+        }
+
         if ((e.KeyCode is Keys.Down or Keys.Up) && addressSuggestionPopup.Visible)
         {
             addressSuggestionPopup.MoveSelection(e.KeyCode == Keys.Down ? 1 : -1);
@@ -10709,6 +11415,37 @@ public sealed class MainForm : Form
         && coreIsCurrent
         && documentIsCurrent;
 
+    private void TryApplyAddressBarAutocomplete()
+    {
+        if (!addressBarEditing || !addressBar.Focused || addressBar.TextLength == 0) return;
+        if (addressBar.SelectionStart != addressBar.TextLength) return;
+
+        var typed = addressBar.Text;
+        if (typed.Length > 40 || typed.Contains(' ') || typed.Contains('/') || typed.Contains(':'))
+        {
+            return;
+        }
+
+        var topMatch = AddressSuggestionEngine.GetTopMatchHost(typed, state);
+        if (!string.IsNullOrEmpty(topMatch)
+            && topMatch.StartsWith(typed, StringComparison.OrdinalIgnoreCase)
+            && topMatch.Length > typed.Length)
+        {
+            isAutocompletingAddressBar = true;
+            try
+            {
+                var typedLength = typed.Length;
+                addressBar.Text = topMatch;
+                addressBar.SelectionStart = typedLength;
+                addressBar.SelectionLength = topMatch.Length - typedLength;
+            }
+            finally
+            {
+                isAutocompletingAddressBar = false;
+            }
+        }
+    }
+
     private void UpdateAddressSuggestions()
     {
         var addressSuggestionsActive = addressBarEditing && addressBar.Focused;
@@ -10731,9 +11468,47 @@ public sealed class MainForm : Form
         }
 
         lastAddressSuggestionInput = query;
-        var suggestions = AddressSuggestionEngine.GetSuggestions(query, state);
-        addressSuggestionPopup.SetSuggestions(suggestions);
+        var localSuggestions = AddressSuggestionEngine.GetSuggestions(query, state);
+        addressSuggestionPopup.SetSuggestions(localSuggestions);
         PositionAddressSuggestions(suggestionAnchor);
+
+        liveSuggestionCts?.Cancel();
+        liveSuggestionCts?.Dispose();
+        liveSuggestionCts = null;
+
+        var targetAnchor = suggestionAnchor;
+        var cts = new CancellationTokenSource();
+        liveSuggestionCts = cts;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var liveQueries = await SearchSuggestionService.Instance.GetSearchSuggestionsAsync(query, cts.Token).ConfigureAwait(false);
+                if (cts.Token.IsCancellationRequested || isClosing) return;
+
+                if (!IsHandleCreated || IsDisposed) return;
+                BeginInvoke(() =>
+                {
+                    if (cts.Token.IsCancellationRequested || isClosing || IsDisposed) return;
+                    if (lastAddressSuggestionInput != query) return;
+                    var currentlyActive = (addressBarEditing && addressBar.Focused)
+                        || (smartSearchBarEditing && activeSmartSearchBar is not null && activeSmartSearchBar.InputControl.Focused);
+                    if (!currentlyActive) return;
+
+                    var merged = AddressSuggestionEngine.MergeWithLiveSearch(localSuggestions, liveQueries, query, state);
+                    addressSuggestionPopup.SetSuggestions(merged);
+                    PositionAddressSuggestions(targetAnchor);
+                });
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception error)
+            {
+                stateStore.Log("Live search suggestions error", error);
+            }
+        });
     }
 
     private void QueueAddressSuggestions(string? input = null, Control? anchor = null)
@@ -10893,6 +11668,9 @@ public sealed class MainForm : Form
 
     private void HideAddressSuggestions()
     {
+        liveSuggestionCts?.Cancel();
+        liveSuggestionCts?.Dispose();
+        liveSuggestionCts = null;
         pendingSuggestionInput = string.Empty;
         lastAddressSuggestionInput = string.Empty;
         addressSuggestionPopup.ClearSuggestions();
@@ -11557,6 +12335,7 @@ public sealed class MainForm : Form
     private void UpdateTabHeader(BrowserTab tab)
     {
         tab.Header.HighContrast = IsHighContrastActive;
+        tab.Header.IsPrivateMode = isPrivateMode;
         tab.Header.SetState(
             tab.Title,
             activeTab == tab,
@@ -11597,17 +12376,18 @@ public sealed class MainForm : Form
             (contentAvailable / tabs.Count) - ScaleChromeLogical(4),
             minimumTabWidth,
             ScaleChromeLogical(220));
+        var contentWidth = tabStrip.Padding.Horizontal;
         foreach (var tab in tabs)
         {
-            tab.Header.Width = tab.IsPinned
+            var headerWidth = tab.IsPinned
                 ? Math.Clamp(
                     Math.Min(width, ScaleChromeLogical(124)),
                     ScaleChromeLogical(92),
                     ScaleChromeLogical(124))
                 : width;
+            tab.Header.Width = headerWidth;
+            contentWidth += headerWidth + tab.Header.Margin.Horizontal;
         }
-        var contentWidth = tabs.Sum(tab => tab.Header.Width + tab.Header.Margin.Horizontal)
-            + tabStrip.Padding.Horizontal;
         var stripWidth = Math.Min(contentWidth, availableWidth);
         var overflowing = contentWidth > availableWidth;
         tabStrip.AutoScrollMinSize = overflowing
@@ -11720,8 +12500,11 @@ public sealed class MainForm : Form
 
     private void UpdateWindowTitle()
     {
-        var suffix = isPrivateMode ? "Private \u2014 MishaWeb" : "MishaWeb";
-        Text = activeTab is null || activeTab.Title.Equals("New tab", StringComparison.OrdinalIgnoreCase)
+        var suffix = isPrivateMode ? "Incognito \u2014 MishaWeb" : "MishaWeb";
+        var isStartOrNew = activeTab is null
+            || activeTab.Title.Equals("New tab", StringComparison.OrdinalIgnoreCase)
+            || activeTab.Title.Equals("Incognito", StringComparison.OrdinalIgnoreCase);
+        Text = isStartOrNew || activeTab is null
             ? suffix
             : $"{activeTab.Title} \u2014 {suffix}";
     }
@@ -12006,6 +12789,7 @@ public sealed class MainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
+        try { System.IO.File.WriteAllText("form_closing.log", $"{e.CloseReason}\n{Environment.StackTrace}"); } catch { }
         if (isClosing) return;
 
         if (Volatile.Read(ref activeExtensionMutationCount) > 0)
@@ -12084,6 +12868,19 @@ public sealed class MainForm : Form
         statusUiTimer.Stop();
         downloadUiTimer.Stop();
         downloadGraceTimer.Stop();
+        if (isPrivateMode)
+        {
+            downloads.Clear();
+            try
+            {
+                var core = tabs.Select(item => item.Core).FirstOrDefault(item => item is not null);
+                if (core is not null)
+                {
+                    _ = core.Profile.ClearBrowsingDataAsync(CoreWebView2BrowsingDataKinds.AllProfile);
+                }
+            }
+            catch { }
+        }
         DisposeAllTabs();
     }
 
@@ -12138,6 +12935,9 @@ public sealed class MainForm : Form
             stateSaveTimer.Dispose();
             transientStatusTimer.Dispose();
             addressSuggestionTimer.Dispose();
+            liveSuggestionCts?.Cancel();
+            liveSuggestionCts?.Dispose();
+            liveSuggestionCts = null;
             findDebounceTimer.Dispose();
             statusUiTimer.Dispose();
             downloadUiTimer.Dispose();
@@ -13544,6 +14344,8 @@ public sealed class MainForm : Form
         private Point pointerDownScreenLocation;
         private string currentTitle = "New tab";
 
+        public bool IsPrivateMode { get; set; }
+
         public TabHeader(ToolTip toolTip)
         {
             this.toolTip = toolTip;
@@ -13726,16 +14528,17 @@ public sealed class MainForm : Form
         {
             base.OnPaint(e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var effectiveAccent = HighContrast
+                ? SystemColors.HighlightText
+                : IsPrivateMode ? NativeUiTheme.Lavender : AccentColor;
             if (isSelected)
             {
-                using var accent = new Pen(HighContrast ? SystemColors.HighlightText : AccentColor, 2f);
+                using var accent = new Pen(effectiveAccent, 2f);
                 e.Graphics.DrawLine(accent, 10, Height - 2, Math.Max(10, Width - 10), Height - 2);
             }
             if (isDragging)
             {
-                using var dragOutline = new Pen(
-                    HighContrast ? SystemColors.HighlightText : AccentColor,
-                    1f)
+                using var dragOutline = new Pen(effectiveAccent, 1f)
                 {
                     DashStyle = DashStyle.Dash
                 };
@@ -13909,11 +14712,14 @@ public sealed class MainForm : Form
         private void ApplyVisualState()
         {
             var highlighted = HighContrast && (isSelected || isHovered);
+            var activeBackground = IsPrivateMode ? Color.FromArgb(48, 20, 56) : TabActiveColor;
+            var idleBackground = IsPrivateMode ? Color.FromArgb(24, 11, 25) : TabIdleColor;
+            var hoverBackground = IsPrivateMode ? Color.FromArgb(38, 16, 44) : NativeUiTheme.Surface;
             var background = HighContrast
                 ? highlighted ? SystemColors.Highlight : SystemColors.Control
                 : isDragging ? NativeUiTheme.Pressed
-                : isSelected ? TabActiveColor
-                : isHovered ? NativeUiTheme.Surface : TabIdleColor;
+                : isSelected ? activeBackground
+                : isHovered ? hoverBackground : idleBackground;
             var foreground = HighContrast
                 ? highlighted ? SystemColors.HighlightText : SystemColors.ControlText
                 : isDragging ? MutedTextColor
@@ -14256,5 +15062,108 @@ public sealed class MainForm : Form
         Insecure,
         CertificateError,
         Failed
+    }
+
+    private sealed class IncognitoBadgeControl : Control
+    {
+        private readonly ToolTip toolTip;
+        private bool isHovered;
+
+        public IncognitoBadgeControl(ToolTip toolTip)
+        {
+            this.toolTip = toolTip;
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.UserPaint,
+                true);
+            TabStop = false;
+            Size = new Size(82, 26);
+            Margin = new Padding(2, 3, 2, 3);
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.StaticText;
+            AccessibleName = "Incognito browsing";
+            AccessibleDescription = "No browsing history, cookies, or site data will be saved.";
+            toolTip.SetToolTip(this, "Incognito mode: browsing history, cookies, and site data are deleted when all incognito windows close.");
+            MouseEnter += (_, _) => { isHovered = true; Invalidate(); };
+            MouseLeave += (_, _) => { isHovered = false; Invalidate(); };
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
+            using var path = CreateRoundedRectanglePath(bounds, 7);
+            var backColor = isHovered ? Color.FromArgb(56, 24, 66) : Color.FromArgb(42, 18, 50);
+            using var brush = new SolidBrush(backColor);
+            using var borderPen = new Pen(isHovered ? NativeUiTheme.Lavender : Color.FromArgb(120, 60, 148), 1f);
+            g.FillPath(brush, path);
+            g.DrawPath(borderPen, path);
+
+            // Draw stealth glasses icon
+            using var lensPen = new Pen(NativeUiTheme.Lavender, 1.4f);
+            var midY = Height / 2;
+            g.DrawEllipse(lensPen, 8, midY - 4, 7, 7);
+            g.DrawEllipse(lensPen, 17, midY - 4, 7, 7);
+            g.DrawLine(lensPen, 14, midY - 2, 18, midY - 2);
+
+            // Draw "Incognito" text
+            using var font = new Font("Segoe UI Semibold", 8.2f, FontStyle.Regular);
+            var textBounds = new Rectangle(27, 0, Width - 29, Height);
+            TextRenderer.DrawText(
+                g,
+                "Incognito",
+                font,
+                textBounds,
+                NativeUiTheme.Lavender,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding);
+        }
+
+        private static GraphicsPath CreateRoundedRectanglePath(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            var diameter = radius * 2;
+            var arc = new Rectangle(bounds.Location, new Size(diameter, diameter));
+            path.AddArc(arc, 180, 90);
+            arc.X = bounds.Right - diameter;
+            path.AddArc(arc, 270, 90);
+            arc.Y = bounds.Bottom - diameter;
+            path.AddArc(arc, 0, 90);
+            arc.X = bounds.Left;
+            path.AddArc(arc, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+}
+
+internal sealed class IncognitoShortcutMessageFilter : IMessageFilter
+{
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_SYSKEYDOWN = 0x0104;
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (m.Msg is WM_KEYDOWN or WM_SYSKEYDOWN)
+        {
+            var key = (Keys)(int)m.WParam;
+            if (key == Keys.N && (Control.ModifierKeys & (Keys.Control | Keys.Shift)) == (Keys.Control | Keys.Shift))
+            {
+                if (Form.ActiveForm is MainForm activeWindow && !activeWindow.IsDisposed)
+                {
+                    activeWindow.OpenPrivateWindow();
+                    return true;
+                }
+                if (Application.OpenForms.OfType<MainForm>().FirstOrDefault(w => !w.IsDisposed) is { } anyWindow)
+                {
+                    anyWindow.OpenPrivateWindow();
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }

@@ -1,8 +1,12 @@
+using System.Drawing.Drawing2D;
+
 namespace MishaWeb;
 
 internal enum ExtensionManagerAction
 {
     Open,
+    OpenPopup,
+    OpenOptions,
     ToggleEnabled,
     Remove
 }
@@ -14,7 +18,14 @@ internal sealed record ExtensionManagerRow(
     bool IsEnabled,
     string? LaunchPath,
     bool CanUpdate,
-    object Token);
+    object Token,
+    string? PopupPath = null,
+    string? OptionsPath = null,
+    string? Description = null,
+    string? IconPath = null,
+    string? StoreId = null,
+    string? FolderPath = null,
+    IReadOnlyList<string>? Capabilities = null);
 
 internal sealed class ExtensionsManagerForm : Form
 {
@@ -26,20 +37,23 @@ internal sealed class ExtensionsManagerForm : Form
     private readonly Func<ExtensionManagerAction, ExtensionManagerRow, Task> rowAction;
     private readonly Action openManagedFolder;
     private readonly Action openUserScriptsFolder;
+
+    private readonly TextBox searchBox = new();
     private readonly TextBox storeAddressBox = new();
     private readonly Button installButton = new();
-    private readonly ListView extensionList = new();
-    private readonly Button openButton = new();
-    private readonly Button toggleButton = new();
-    private readonly Button removeButton = new();
-    private readonly Button updateButton = new();
-    private readonly Button refreshButton = new();
     private readonly Button packageButton = new();
     private readonly Button unpackedButton = new();
     private readonly Button managedFolderButton = new();
     private readonly Button userScriptsButton = new();
+    private readonly Button refreshButton = new();
     private readonly Button closeButton = new();
     private readonly Label statusLabel = new();
+    private readonly Label emptyLabel = new();
+    private readonly Panel cardsContainer = new();
+    private readonly TableLayoutPanel cardsStack = new();
+
+    private readonly List<ExtensionCard> loadedCards = [];
+    private IReadOnlyList<ExtensionManagerRow> currentRows = [];
     private CancellationTokenSource? operationCancellation;
     private bool busy;
     private bool closeWhenIdle;
@@ -69,8 +83,8 @@ internal sealed class ExtensionsManagerForm : Form
         FormBorderStyle = FormBorderStyle.Sizable;
         MinimizeBox = false;
         ShowInTaskbar = false;
-        ClientSize = new Size(760, 510);
-        MinimumSize = new Size(620, 430);
+        ClientSize = new Size(840, 580);
+        MinimumSize = new Size(660, 460);
         AccessibleRole = AccessibleRole.Dialog;
         AccessibleName = "Browser extensions manager";
 
@@ -79,87 +93,147 @@ internal sealed class ExtensionsManagerForm : Form
             Dock = DockStyle.Fill,
             Padding = new Padding(14),
             ColumnCount = 1,
-            RowCount = 6
+            RowCount = 5
         };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
+        // 1. Notice & Title
+        var headerLayout = new TableLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Top,
+            ColumnCount = 1,
+            RowCount = 2,
+            Margin = new Padding(0, 0, 0, 8)
+        };
+        var titleLabel = new Label
+        {
+            AutoSize = true,
+            Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+            ForeColor = NativeUiTheme.Text,
+            Text = "Extensions"
+        };
         var explanation = new Label
         {
             AutoSize = true,
-            MaximumSize = new Size(720, 0),
-            Margin = new Padding(0, 0, 0, 10),
-            Text = "Install from a Chrome Web Store listing address or extension ID. "
+            MaximumSize = new Size(800, 0),
+            Margin = new Padding(0, 2, 0, 0),
+            ForeColor = NativeUiTheme.SecondaryText,
+            Font = new Font("Segoe UI", 9f),
+            Text = "Install from Chrome Web Store by URL or extension ID. "
                 + "Extensions can read and change webpages, so install only ones you trust."
         };
         explanation.AccessibleName = "Extension safety notice";
-        root.Controls.Add(explanation, 0, 0);
+        headerLayout.Controls.Add(titleLabel, 0, 0);
+        headerLayout.Controls.Add(explanation, 0, 1);
+        root.Controls.Add(headerLayout, 0, 0);
 
+        // 2. Search & Install Bar
         var storePanel = new TableLayoutPanel
         {
             AutoSize = true,
             Dock = DockStyle.Top,
-            ColumnCount = 2,
-            Margin = new Padding(0, 0, 0, 10)
+            ColumnCount = 3,
+            Margin = new Padding(0, 0, 0, 8)
         };
-        storePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        storePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42f));
+        storePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 58f));
         storePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        searchBox.Dock = DockStyle.Fill;
+        searchBox.PlaceholderText = "Search installed extensions…";
+        searchBox.AccessibleName = "Search installed extensions";
+        searchBox.Margin = new Padding(0, 0, 8, 0);
+
         storeAddressBox.Dock = DockStyle.Fill;
-        storeAddressBox.PlaceholderText = "Chrome Web Store URL or 32-character extension ID";
+        storeAddressBox.PlaceholderText = "Chrome Web Store URL or 32-character ID";
         storeAddressBox.AccessibleName = "Chrome Web Store extension address";
+        storeAddressBox.Margin = new Padding(0, 0, 6, 0);
+
         ConfigureButton(installButton, "Install", "Download and install the Chrome Web Store extension");
-        installButton.Margin = new Padding(8, 0, 0, 0);
-        storePanel.Controls.Add(storeAddressBox, 0, 0);
-        storePanel.Controls.Add(installButton, 1, 0);
+        installButton.Margin = Padding.Empty;
+
+        storePanel.Controls.Add(searchBox, 0, 0);
+        storePanel.Controls.Add(storeAddressBox, 1, 0);
+        storePanel.Controls.Add(installButton, 2, 0);
         root.Controls.Add(storePanel, 0, 1);
 
-        extensionList.Dock = DockStyle.Fill;
-        extensionList.View = View.Details;
-        extensionList.FullRowSelect = true;
-        extensionList.HideSelection = false;
-        extensionList.MultiSelect = false;
-        extensionList.AccessibleName = "Installed extensions";
-        extensionList.Columns.Add("State", 85);
-        extensionList.Columns.Add("Name", 225);
-        extensionList.Columns.Add("Version", 95);
-        extensionList.Columns.Add("Extension ID", 305);
-        root.Controls.Add(extensionList, 0, 2);
-
-        var selectionActions = NativeDialogLayout.CreateActionBar(wrap: true);
-        ConfigureButton(openButton, "Open", "Open the selected extension popup or options page");
-        ConfigureButton(toggleButton, "Disable", "Enable or disable the selected extension");
-        ConfigureButton(removeButton, "Remove", "Remove the selected extension and its managed files");
-        ConfigureButton(updateButton, "Check update", "Check the Chrome Web Store for a signed update");
-        ConfigureButton(refreshButton, "Refresh", "Refresh the installed extensions list");
-        selectionActions.Controls.AddRange([refreshButton, removeButton, updateButton, toggleButton, openButton]);
-        root.Controls.Add(selectionActions, 0, 3);
-
-        var importActions = NativeDialogLayout.CreateActionBar(wrap: true);
+        // 3. Secondary Actions Toolbar
+        var importActions = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true,
+            Margin = new Padding(0, 0, 0, 8)
+        };
         ConfigureButton(packageButton, "Install package…", "Install a local CRX or ZIP extension package");
         ConfigureButton(unpackedButton, "Load unpacked…", "Copy and install an unpacked extension folder");
         ConfigureButton(managedFolderButton, "Managed files", "Open MishaWeb's managed extension package folder");
         ConfigureButton(userScriptsButton, "User scripts", "Open the separate JavaScript user scripts folder");
-        ConfigureButton(closeButton, "Close", "Close the extensions manager");
-        CancelButton = closeButton;
-        importActions.Controls.AddRange(
-            [closeButton, userScriptsButton, managedFolderButton, unpackedButton, packageButton]);
-        root.Controls.Add(importActions, 0, 4);
+        ConfigureButton(refreshButton, "Refresh", "Refresh the installed extensions list");
+        importActions.Controls.AddRange([packageButton, unpackedButton, managedFolderButton, userScriptsButton, refreshButton]);
+        root.Controls.Add(importActions, 0, 2);
+
+        // 4. Cards container
+        cardsContainer.Dock = DockStyle.Fill;
+        cardsContainer.AutoScroll = true;
+        cardsContainer.BackColor = NativeUiTheme.Window;
+
+        cardsStack.Dock = DockStyle.Top;
+        cardsStack.AutoSize = true;
+        cardsStack.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        cardsStack.ColumnCount = 1;
+        cardsStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        cardsStack.BackColor = NativeUiTheme.Window;
+        cardsStack.Margin = Padding.Empty;
+        cardsStack.Padding = new Padding(0, 0, 6, 0);
+
+        emptyLabel.Dock = DockStyle.Fill;
+        emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
+        emptyLabel.Font = new Font("Segoe UI", 10.5f);
+        emptyLabel.ForeColor = NativeUiTheme.MutedText;
+        emptyLabel.Text = "No browser extensions are installed";
+        emptyLabel.Visible = false;
+
+        cardsContainer.Controls.Add(cardsStack);
+        cardsContainer.Controls.Add(emptyLabel);
+        root.Controls.Add(cardsContainer, 0, 3);
+
+        // 5. Bottom status & close bar
+        var bottomBar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ColumnCount = 2,
+            RowCount = 1,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        bottomBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        bottomBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
         statusLabel.AutoEllipsis = true;
         statusLabel.Dock = DockStyle.Fill;
-        statusLabel.AutoSize = true;
-        statusLabel.MinimumSize = new Size(0, 24);
-        statusLabel.Margin = new Padding(0, 8, 0, 0);
+        statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        statusLabel.ForeColor = NativeUiTheme.SecondaryText;
         statusLabel.Text = "Loading installed extensions…";
         statusLabel.AccessibleName = "Extension manager status";
-        root.Controls.Add(statusLabel, 0, 5);
+
+        ConfigureButton(closeButton, "Close", "Close the extensions manager");
+        CancelButton = closeButton;
+
+        bottomBar.Controls.Add(statusLabel, 0, 0);
+        bottomBar.Controls.Add(closeButton, 1, 0);
+        root.Controls.Add(bottomBar, 0, 4);
+
         Controls.Add(root);
         NativeUiTheme.Apply(this, installButton);
 
+        // Event wiring
         installButton.Click += async (_, _) => await InstallStoreExtensionAsync();
         storeAddressBox.KeyDown += async (_, e) =>
         {
@@ -167,18 +241,14 @@ internal sealed class ExtensionsManagerForm : Form
             e.SuppressKeyPress = true;
             await InstallStoreExtensionAsync();
         };
-        extensionList.SelectedIndexChanged += (_, _) => UpdateButtons();
-        extensionList.DoubleClick += async (_, _) => await RunRowActionAsync(ExtensionManagerAction.Open);
-        openButton.Click += async (_, _) => await RunRowActionAsync(ExtensionManagerAction.Open);
-        toggleButton.Click += async (_, _) => await RunRowActionAsync(ExtensionManagerAction.ToggleEnabled);
-        removeButton.Click += async (_, _) => await RemoveSelectedAsync();
-        updateButton.Click += async (_, _) => await UpdateSelectedAsync();
-        refreshButton.Click += async (_, _) => await RefreshRowsAsync();
+        searchBox.TextChanged += (_, _) => FilterCards();
         packageButton.Click += async (_, _) => await SelectPackageAsync();
         unpackedButton.Click += async (_, _) => await SelectUnpackedAsync();
         managedFolderButton.Click += (_, _) => openManagedFolder();
         userScriptsButton.Click += (_, _) => openUserScriptsFolder();
+        refreshButton.Click += async (_, _) => await RefreshRowsAsync();
         closeButton.Click += (_, _) => Close();
+
         FormClosing += (_, e) =>
         {
             if (!busy || e.CloseReason != CloseReason.UserClosing) return;
@@ -188,7 +258,7 @@ internal sealed class ExtensionsManagerForm : Form
             SetStatus("Finishing the current extension operation before closing…");
         };
         Shown += async (_, _) => await RefreshRowsAsync();
-        UpdateButtons();
+        UpdateControlsState();
     }
 
     public void PrefillStoreAddress(string? value)
@@ -202,10 +272,43 @@ internal sealed class ExtensionsManagerForm : Form
 
     public Task RefreshAfterExternalChangeAsync() => RefreshRowsAsync();
 
-    private ExtensionManagerRow? SelectedRow =>
-        extensionList.SelectedItems.Count == 1
-            ? extensionList.SelectedItems[0].Tag as ExtensionManagerRow
-            : null;
+    private void FilterCards()
+    {
+        var filter = searchBox.Text.Trim();
+        var visibleCount = 0;
+        cardsStack.SuspendLayout();
+        try
+        {
+            foreach (var card in loadedCards)
+            {
+                var matches = string.IsNullOrEmpty(filter)
+                    || card.Row.Name.Contains(filter, StringComparison.CurrentCultureIgnoreCase)
+                    || card.Row.Id.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                    || (card.Row.Description is not null && card.Row.Description.Contains(filter, StringComparison.CurrentCultureIgnoreCase));
+                card.Visible = matches;
+                if (matches) visibleCount++;
+            }
+        }
+        finally
+        {
+            cardsStack.ResumeLayout();
+        }
+
+        if (loadedCards.Count == 0)
+        {
+            emptyLabel.Text = "No browser extensions are installed";
+            emptyLabel.Visible = true;
+        }
+        else if (visibleCount == 0)
+        {
+            emptyLabel.Text = $"No extensions match \"{filter}\"";
+            emptyLabel.Visible = true;
+        }
+        else
+        {
+            emptyLabel.Visible = false;
+        }
+    }
 
     private async Task InstallStoreExtensionAsync()
     {
@@ -253,10 +356,8 @@ internal sealed class ExtensionsManagerForm : Form
             "Unpacked extension installed");
     }
 
-    private async Task RemoveSelectedAsync()
+    internal async Task RemoveRowAsync(ExtensionManagerRow row)
     {
-        var row = SelectedRow;
-        if (row is null) return;
         var confirmation = MessageBox.Show(
             this,
             $"Remove {row.Name}? Its MishaWeb-managed package files will also be deleted.",
@@ -265,46 +366,41 @@ internal sealed class ExtensionsManagerForm : Form
             MessageBoxIcon.Warning,
             MessageBoxDefaultButton.Button2);
         if (confirmation != DialogResult.Yes) return;
-        await RunRowActionAsync(ExtensionManagerAction.Remove);
+        await RunRowActionCoreAsync(ExtensionManagerAction.Remove, row);
     }
 
-    private async Task UpdateSelectedAsync()
+    internal async Task UpdateRowAsync(ExtensionManagerRow row)
     {
-        var row = SelectedRow;
-        if (row is null || !row.CanUpdate || busy) return;
+        if (!row.CanUpdate || busy) return;
         var completed = "Extension update check completed";
         await RunOperationCoreAsync(
-            "Checking the Chrome Web Store for a signed update\u2026",
+            $"Checking the Chrome Web Store for a signed update for {row.Name}…",
             async token => completed = await updateFromStore(row, token),
             () => completed);
     }
 
-    private async Task RunRowActionAsync(ExtensionManagerAction action)
+    internal async Task RunRowActionCoreAsync(ExtensionManagerAction action, ExtensionManagerRow row)
     {
-        var row = SelectedRow;
-        if (row is null
-            || busy
-            || (action == ExtensionManagerAction.Open && (!row.IsEnabled || row.LaunchPath is null)))
-        {
-            return;
-        }
+        if (busy) return;
         var progress = action switch
         {
-            ExtensionManagerAction.Open => "Opening extension…",
+            ExtensionManagerAction.Open or ExtensionManagerAction.OpenPopup => $"Opening {row.Name} popup…",
+            ExtensionManagerAction.OpenOptions => $"Opening {row.Name} options…",
             ExtensionManagerAction.ToggleEnabled => row.IsEnabled
-                ? "Disabling extension…"
-                : "Enabling extension…",
-            ExtensionManagerAction.Remove => "Removing extension…",
+                ? $"Disabling {row.Name}…"
+                : $"Enabling {row.Name}…",
+            ExtensionManagerAction.Remove => $"Removing {row.Name}…",
             _ => "Updating extension…"
         };
         var completed = action switch
         {
-            ExtensionManagerAction.Open => "Extension opened",
+            ExtensionManagerAction.Open or ExtensionManagerAction.OpenPopup => $"{row.Name} opened",
+            ExtensionManagerAction.OpenOptions => $"{row.Name} options opened",
             ExtensionManagerAction.ToggleEnabled => row.IsEnabled
-                ? "Extension disabled"
-                : "Extension enabled",
-            ExtensionManagerAction.Remove => "Extension removed",
-            _ => "Extension updated"
+                ? $"{row.Name} disabled"
+                : $"{row.Name} enabled",
+            ExtensionManagerAction.Remove => $"{row.Name} removed",
+            _ => $"{row.Name} updated"
         };
         await RunOperationAsync(progress, _ => rowAction(action, row), completed);
     }
@@ -324,7 +420,7 @@ internal sealed class ExtensionsManagerForm : Form
         busy = true;
         operationCancellation = new CancellationTokenSource();
         SetStatus(progress);
-        UpdateButtons();
+        UpdateControlsState();
         try
         {
             var operationSucceeded = false;
@@ -366,13 +462,13 @@ internal sealed class ExtensionsManagerForm : Form
         }
         finally
         {
-            operationCancellation.Dispose();
+            operationCancellation?.Dispose();
             operationCancellation = null;
             busy = false;
             if (!IsDisposed)
             {
                 if (closeWhenIdle) Close();
-                else UpdateButtons();
+                else UpdateControlsState();
             }
         }
     }
@@ -382,14 +478,14 @@ internal sealed class ExtensionsManagerForm : Form
         if (busy) return;
         busy = true;
         SetStatus("Refreshing installed extensions…");
-        UpdateButtons();
+        UpdateControlsState();
         try
         {
             await RefreshRowsCoreAsync();
             if (IsDisposed) return;
-            SetStatus(extensionList.Items.Count == 0
+            SetStatus(currentRows.Count == 0
                 ? "No browser extensions are installed"
-                : $"{extensionList.Items.Count} extension(s) installed");
+                : $"{currentRows.Count} extension(s) installed");
         }
         catch (Exception error)
         {
@@ -401,60 +497,55 @@ internal sealed class ExtensionsManagerForm : Form
             if (!IsDisposed)
             {
                 if (closeWhenIdle) Close();
-                else UpdateButtons();
+                else UpdateControlsState();
             }
         }
     }
 
     private async Task RefreshRowsCoreAsync()
     {
-        var selectedId = SelectedRow?.Id;
         var rows = await rowProvider();
         if (IsDisposed) return;
-        extensionList.BeginUpdate();
+        currentRows = rows;
+        cardsStack.SuspendLayout();
         try
         {
-            extensionList.Items.Clear();
-            foreach (var row in rows.OrderBy(row => row.Name, StringComparer.CurrentCultureIgnoreCase))
+            foreach (var card in loadedCards)
             {
-                var item = new ListViewItem(row.IsEnabled ? "Enabled" : "Disabled") { Tag = row };
-                item.SubItems.Add(row.Name);
-                item.SubItems.Add(row.Version);
-                item.SubItems.Add(row.Id);
-                extensionList.Items.Add(item);
-                if (row.Id.Equals(selectedId, StringComparison.OrdinalIgnoreCase)) item.Selected = true;
+                cardsStack.Controls.Remove(card);
+                card.Dispose();
+            }
+            loadedCards.Clear();
+
+            var sortedRows = rows.OrderBy(r => r.Name, StringComparer.CurrentCultureIgnoreCase);
+            foreach (var row in sortedRows)
+            {
+                var card = new ExtensionCard(row, this);
+                loadedCards.Add(card);
+                cardsStack.Controls.Add(card);
             }
         }
         finally
         {
-            extensionList.EndUpdate();
+            cardsStack.ResumeLayout();
         }
-        if (extensionList.SelectedItems.Count == 0 && extensionList.Items.Count > 0)
-        {
-            extensionList.Items[0].Selected = true;
-        }
+        FilterCards();
     }
 
-    private void UpdateButtons()
+    private void UpdateControlsState()
     {
-        var row = SelectedRow;
+        searchBox.Enabled = !busy;
         storeAddressBox.Enabled = !busy;
         installButton.Enabled = !busy;
         packageButton.Enabled = !busy;
         unpackedButton.Enabled = !busy;
         refreshButton.Enabled = !busy;
-        extensionList.Enabled = !busy;
-        openButton.Enabled = !busy && row?.LaunchPath is not null && row.IsEnabled;
-        toggleButton.Enabled = !busy && row is not null;
-        toggleButton.Text = row?.IsEnabled == false ? "Enable" : "Disable";
-        toggleButton.AccessibleName = toggleButton.Text;
-        toggleButton.AccessibleDescription = row?.IsEnabled == false
-            ? "Enable the selected extension"
-            : "Disable the selected extension";
-        removeButton.Enabled = !busy && row is not null;
-        updateButton.Enabled = !busy && row?.CanUpdate == true;
         managedFolderButton.Enabled = !busy;
         userScriptsButton.Enabled = !busy;
+        foreach (var card in loadedCards)
+        {
+            card.UpdateBusyState(busy);
+        }
     }
 
     private void SetStatus(string text)
@@ -465,14 +556,7 @@ internal sealed class ExtensionsManagerForm : Form
 
     private static void ConfigureButton(Button button, string text, string description)
     {
-        button.AutoSize = true;
-        button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-        button.MinimumSize = new Size(78, 30);
-        button.Padding = new Padding(8, 0, 8, 0);
-        button.Margin = new Padding(4, 4, 0, 4);
-        button.Text = text;
-        button.AccessibleName = text;
-        button.AccessibleDescription = description;
+        NativeDialogLayout.ConfigureButton(button, text, description);
     }
 
     protected override void Dispose(bool disposing)
@@ -481,7 +565,348 @@ internal sealed class ExtensionsManagerForm : Form
         {
             operationCancellation?.Cancel();
             operationCancellation?.Dispose();
+            foreach (var card in loadedCards) card.Dispose();
+            loadedCards.Clear();
         }
         base.Dispose(disposing);
+    }
+
+    private sealed class ExtensionCard : Panel
+    {
+        public ExtensionManagerRow Row { get; private set; }
+        private readonly ExtensionsManagerForm parentForm;
+        private readonly Panel detailsPanel = new();
+        private readonly Button detailsButton = new();
+        private readonly Button toggleButton = new();
+        private readonly Button? openPopupButton;
+        private readonly Button? optionsButton;
+        private readonly Button? updateButton;
+        private readonly Button? removeButton;
+        private Image? iconImage;
+
+        public ExtensionCard(
+            ExtensionManagerRow row,
+            ExtensionsManagerForm parentForm)
+        {
+            Row = row;
+            this.parentForm = parentForm;
+            Dock = DockStyle.Top;
+            AutoSize = true;
+            AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            Margin = new Padding(0, 0, 0, 10);
+            Padding = new Padding(12);
+            BackColor = NativeUiTheme.Surface;
+            ForeColor = NativeUiTheme.Text;
+
+            var layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                ColumnCount = 1,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty
+            };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            // Row 1: Top header with icon, title, version, badges
+            var header = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                ColumnCount = 2,
+                Margin = new Padding(0, 0, 0, 6)
+            };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 46));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            if (row.IconPath is not null && File.Exists(row.IconPath))
+            {
+                try { iconImage = Image.FromFile(row.IconPath); }
+                catch { }
+            }
+
+            var iconBox = new ExtensionIconBox(iconImage, row.Name);
+            iconBox.Size = new Size(36, 36);
+            iconBox.Margin = new Padding(0, 2, 8, 0);
+            header.Controls.Add(iconBox, 0, 0);
+
+            var titleFlow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Margin = Padding.Empty
+            };
+
+            var nameLabel = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                ForeColor = NativeUiTheme.Text,
+                Text = row.Name,
+                Margin = new Padding(0, 0, 6, 2)
+            };
+
+            var versionBadge = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.25f),
+                BackColor = NativeUiTheme.SurfaceRaised,
+                ForeColor = NativeUiTheme.SecondaryText,
+                Text = $"v{row.Version}",
+                Padding = new Padding(4, 1, 4, 1),
+                Margin = new Padding(0, 2, 6, 2)
+            };
+
+            var sourceText = row.StoreId is not null
+                ? "Chrome Web Store"
+                : row.FolderPath is not null ? "Local / Unpacked" : "System";
+            var sourceBadge = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.25f),
+                BackColor = NativeUiTheme.SurfaceRaised,
+                ForeColor = NativeUiTheme.MutedText,
+                Text = sourceText,
+                Padding = new Padding(4, 1, 4, 1),
+                Margin = new Padding(0, 2, 6, 2)
+            };
+
+            var statusBadge = new Label
+            {
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                ForeColor = row.IsEnabled ? NativeUiTheme.Positive : NativeUiTheme.MutedText,
+                Text = row.IsEnabled ? "Enabled" : "Disabled",
+                Margin = new Padding(0, 2, 0, 2)
+            };
+
+            titleFlow.Controls.AddRange([nameLabel, versionBadge, sourceBadge, statusBadge]);
+            header.Controls.Add(titleFlow, 1, 0);
+            layout.Controls.Add(header, 0, 0);
+
+            // Row 2: Description & ID
+            var descText = string.IsNullOrWhiteSpace(row.Description)
+                ? "No description declared in extension manifest."
+                : row.Description;
+            var descLabel = new Label
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 9f),
+                ForeColor = NativeUiTheme.SecondaryText,
+                Text = descText,
+                Margin = new Padding(0, 0, 0, 4)
+            };
+            layout.Controls.Add(descLabel, 0, 1);
+
+            var idLabel = new Label
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                Font = new Font("Consolas", 8.25f),
+                ForeColor = NativeUiTheme.MutedText,
+                Text = $"ID: {row.Id}",
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            layout.Controls.Add(idLabel, 0, 2);
+
+            // Row 3: Action Buttons
+            var actions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = true,
+                Margin = Padding.Empty
+            };
+
+            var hasPopup = row.PopupPath is not null || row.LaunchPath is not null;
+            if (hasPopup)
+            {
+                openPopupButton = new Button();
+                ConfigureButton(openPopupButton, "Open popup", "Open the interactive extension popup page");
+                openPopupButton.Click += async (_, _) => await parentForm.RunRowActionCoreAsync(ExtensionManagerAction.OpenPopup, row);
+                actions.Controls.Add(openPopupButton);
+            }
+
+            var hasOptions = row.OptionsPath is not null;
+            if (hasOptions)
+            {
+                optionsButton = new Button();
+                ConfigureButton(optionsButton, "Options", "Open extension settings and options page");
+                optionsButton.Click += async (_, _) => await parentForm.RunRowActionCoreAsync(ExtensionManagerAction.OpenOptions, row);
+                actions.Controls.Add(optionsButton);
+            }
+
+            ConfigureButton(toggleButton, row.IsEnabled ? "Disable" : "Enable", "Enable or disable this extension");
+            toggleButton.Click += async (_, _) => await parentForm.RunRowActionCoreAsync(ExtensionManagerAction.ToggleEnabled, row);
+            actions.Controls.Add(toggleButton);
+
+            if (row.CanUpdate)
+            {
+                updateButton = new Button();
+                ConfigureButton(updateButton, "Check update", "Check Chrome Web Store for a signed update");
+                updateButton.Click += async (_, _) => await parentForm.UpdateRowAsync(row);
+                actions.Controls.Add(updateButton);
+            }
+
+            var canRemove = row.StoreId is not null || row.FolderPath is not null;
+            if (canRemove)
+            {
+                removeButton = new Button();
+                ConfigureButton(removeButton, "Remove", "Uninstall this extension");
+                removeButton.Click += async (_, _) => await parentForm.RemoveRowAsync(row);
+                actions.Controls.Add(removeButton);
+            }
+
+            ConfigureButton(detailsButton, "Details ▾", "View extension details, folder, and permissions");
+            detailsButton.Click += (_, _) =>
+            {
+                detailsPanel.Visible = !detailsPanel.Visible;
+                detailsButton.Text = detailsPanel.Visible ? "Details ▴" : "Details ▾";
+            };
+            actions.Controls.Add(detailsButton);
+            layout.Controls.Add(actions, 0, 3);
+
+            // Row 4: Expandable Details Panel
+            detailsPanel.Dock = DockStyle.Top;
+            detailsPanel.AutoSize = true;
+            detailsPanel.Visible = false;
+            detailsPanel.BackColor = NativeUiTheme.SurfaceRaised;
+            detailsPanel.Padding = new Padding(10);
+            detailsPanel.Margin = new Padding(0, 8, 0, 0);
+
+            var detailsLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                ColumnCount = 1,
+                Margin = Padding.Empty
+            };
+            detailsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+
+            if (!string.IsNullOrEmpty(row.FolderPath))
+            {
+                var folderLabel = new Label
+                {
+                    Dock = DockStyle.Top,
+                    AutoSize = true,
+                    Font = new Font("Segoe UI", 8.5f),
+                    ForeColor = NativeUiTheme.SecondaryText,
+                    Text = $"Package folder: {row.FolderPath}",
+                    Margin = new Padding(0, 0, 0, 4)
+                };
+                detailsLayout.Controls.Add(folderLabel, 0, 0);
+            }
+
+            if (row.StoreId is not null)
+            {
+                var storeUrlLabel = new Label
+                {
+                    Dock = DockStyle.Top,
+                    AutoSize = true,
+                    Font = new Font("Segoe UI", 8.5f),
+                    ForeColor = NativeUiTheme.Accent,
+                    Text = $"Chrome Web Store: https://chromewebstore.google.com/detail/{row.StoreId}",
+                    Margin = new Padding(0, 0, 0, 6)
+                };
+                detailsLayout.Controls.Add(storeUrlLabel, 0, 1);
+            }
+
+            var capList = row.Capabilities ?? [];
+            var capText = capList.Count == 0
+                ? "No special permissions or site access declared in manifest."
+                : "Declared permissions and site access:" + Environment.NewLine + string.Join(Environment.NewLine, capList.Select(c => "  • " + c));
+            var capLabel = new Label
+            {
+                Dock = DockStyle.Top,
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = NativeUiTheme.SecondaryText,
+                Text = capText,
+                Margin = new Padding(0, 0, 0, 4)
+            };
+            detailsLayout.Controls.Add(capLabel, 0, 2);
+
+            detailsPanel.Controls.Add(detailsLayout);
+            layout.Controls.Add(detailsPanel, 0, 4);
+
+            Controls.Add(layout);
+            if (openPopupButton is not null) NativeUiTheme.ApplyAccentButton(openPopupButton);
+        }
+
+        public void UpdateBusyState(bool busy)
+        {
+            if (openPopupButton is not null) openPopupButton.Enabled = !busy && Row.IsEnabled;
+            if (optionsButton is not null) optionsButton.Enabled = !busy && Row.IsEnabled;
+            toggleButton.Enabled = !busy;
+            if (updateButton is not null) updateButton.Enabled = !busy && Row.CanUpdate && Row.IsEnabled;
+            if (removeButton is not null) removeButton.Enabled = !busy;
+            detailsButton.Enabled = !busy;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using var pen = new Pen(NativeUiTheme.Border, 1);
+            e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                iconImage?.Dispose();
+                iconImage = null;
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class ExtensionIconBox : Control
+    {
+        private readonly Image? iconImage;
+        private readonly string name;
+
+        public ExtensionIconBox(Image? iconImage, string name)
+        {
+            this.iconImage = iconImage;
+            this.name = name;
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint
+                | ControlStyles.OptimizedDoubleBuffer
+                | ControlStyles.ResizeRedraw
+                | ControlStyles.UserPaint,
+                true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (iconImage is not null)
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(iconImage, ClientRectangle);
+                return;
+            }
+
+            using var bgBrush = new SolidBrush(NativeUiTheme.SurfaceRaised);
+            g.FillEllipse(bgBrush, 1, 1, Width - 2, Height - 2);
+            using var borderPen = new Pen(NativeUiTheme.Border, 1);
+            g.DrawEllipse(borderPen, 1, 1, Width - 2, Height - 2);
+
+            var letter = string.IsNullOrWhiteSpace(name) ? "E" : name.TrimStart()[0].ToString().ToUpperInvariant();
+            using var textBrush = new SolidBrush(NativeUiTheme.Accent);
+            using var font = new Font("Segoe UI", 12f, FontStyle.Bold);
+            using var sf = new StringFormat
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center
+            };
+            g.DrawString(letter, font, textBrush, ClientRectangle, sf);
+        }
     }
 }

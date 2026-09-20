@@ -9,6 +9,14 @@ desktop/.publish-backup-*/
 desktop/.portable-backup-*/
 desktop.tests/bin/
 desktop.tests/obj/
+desktop.youtubeprobe/bin/
+desktop.youtubeprobe/obj/
+artifacts/
+scratch/
+*.log
+desktop.tests/critique-output*/
+desktop.tests/probe-*/
+
 MishaWeb.exe
 MishaWeb.release.json
 MishaWeb.sha256
@@ -22,3 +30,5 @@ MishaWeb.deps.json
 MishaWeb.runtimeconfig.json
 Microsoft.Web.WebView2.*.xml
 web/
+.vs/
+*.user

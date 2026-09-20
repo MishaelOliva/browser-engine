@@ -22,7 +22,9 @@ internal readonly record struct AddressSuggestion(
     string Title,
     string Detail,
     string AcceptText,
-    string NavigationTarget)
+    string NavigationTarget,
+    bool IsTopMatch = false,
+    bool IsSearchHistory = false)
 {
     public bool IsSearch => Source == AddressSuggestionSource.Search;
 }
@@ -93,14 +95,24 @@ internal static class AddressSuggestionEngine
         for (var index = 0; index < localCount; index++)
         {
             var candidate = topCandidates[index];
+            var isTopMatch = index == 0 && (candidate.Match == AddressSuggestionMatch.Exact || candidate.Quality <= 1);
+            var detailText = candidate.IsSearchQuery
+                ? candidate.SearchProviderName
+                : TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay);
+            var acceptText = candidate.IsSearchQuery
+                ? candidate.Title
+                : candidate.Url;
+
             results[index] = new AddressSuggestion(
                 index,
                 candidate.Source,
                 candidate.Match,
                 candidate.Title,
-                TextSafety.FormatUrlForDisplay(candidate.Url, MaximumUrlCharactersToDisplay),
+                detailText,
+                acceptText,
                 candidate.Url,
-                candidate.Url);
+                isTopMatch,
+                candidate.IsSearchQuery);
         }
 
         if (searchUrl is not null)
@@ -124,7 +136,13 @@ internal static class AddressSuggestionEngine
         Candidate[] topCandidates,
         ref int topCandidateCount)
     {
-        var match = Classify(query, indexedCandidate.Title, indexedCandidate.Url);
+        var match = Classify(
+            query,
+            indexedCandidate.Title,
+            indexedCandidate.Url,
+            indexedCandidate.Host,
+            indexedCandidate.IsRootHost,
+            indexedCandidate.IsSearchQuery);
         if (!match.IsMatch) return;
 
         var candidate = new Candidate(
@@ -136,7 +154,9 @@ internal static class AddressSuggestionEngine
             indexedCandidate.Url,
             indexedCandidate.AcceptedCount,
             indexedCandidate.LastAcceptedUtc,
-            indexedCandidate.UrlHash);
+            indexedCandidate.UrlHash,
+            indexedCandidate.IsSearchQuery,
+            indexedCandidate.SearchProviderName);
 
         AddTopCandidate(candidate, topCandidates, ref topCandidateCount);
     }
@@ -285,9 +305,24 @@ internal static class AddressSuggestionEngine
             return;
         }
 
-        title = string.IsNullOrWhiteSpace(title)
-            ? TextSafety.FormatUrlForDisplay(url, MaximumTitleCharactersToMatch)
-            : title;
+        var isSearchQuery = false;
+        var searchProviderName = string.Empty;
+        if (source == AddressSuggestionSource.History && TryExtractSearchEngineQuery(parsedUrl, out var queryText, out searchProviderName))
+        {
+            title = queryText;
+            isSearchQuery = true;
+        }
+        else
+        {
+            title = string.IsNullOrWhiteSpace(title)
+                ? TextSafety.FormatUrlForDisplay(url, MaximumTitleCharactersToMatch)
+                : title;
+        }
+
+        var host = parsedUrl.IdnHost;
+        if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) host = host[4..];
+        var isRootHost = parsedUrl.AbsolutePath.Length <= 1 && string.IsNullOrEmpty(parsedUrl.Query);
+
         var usage = usageByUrl.TryGetValue(url, out var recordedUsage)
             ? recordedUsage
             : default;
@@ -298,10 +333,20 @@ internal static class AddressSuggestionEngine
             url,
             GetUrlHash(parsedUrl),
             usage.AcceptedCount,
-            usage.LastAcceptedUtc));
+            usage.LastAcceptedUtc,
+            isSearchQuery,
+            searchProviderName,
+            host,
+            isRootHost));
     }
 
-    private static MatchResult Classify(string query, string title, string url)
+    private static MatchResult Classify(
+        string query,
+        string title,
+        string url,
+        string host,
+        bool isRootHost,
+        bool isSearchQuery)
     {
         if (title.Equals(query, StringComparison.OrdinalIgnoreCase))
         {
@@ -321,14 +366,36 @@ internal static class AddressSuggestionEngine
         var titleSpan = Limit(title.AsSpan(), MaximumTitleCharactersToMatch);
         var urlSpan = Limit(url.AsSpan(), MaximumUrlCharactersToMatch);
 
+        // 1. Host Prefix Matches (Highest priority for omnibox navigation)
+        var hostSpan = host.AsSpan();
+        if (hostSpan.StartsWith(querySpan, StringComparison.OrdinalIgnoreCase))
+        {
+            // Root host prefix match: e.g. "youtube.com" or "github.com" for query "y" or "git"
+            if (isRootHost)
+            {
+                return MatchResult.Found(AddressSuggestionMatch.Prefix, 0);
+            }
+            return MatchResult.Found(AddressSuggestionMatch.Prefix, 1);
+        }
+
+        // 2. Clean Site Title or Search Query Prefix Matches
         if (titleSpan.StartsWith(querySpan, StringComparison.OrdinalIgnoreCase))
         {
-            return MatchResult.Found(AddressSuggestionMatch.Prefix, 0);
+            if (isSearchQuery)
+            {
+                return MatchResult.Found(AddressSuggestionMatch.Prefix, 1);
+            }
+            if (!IsNoisyTitle(titleSpan))
+            {
+                return MatchResult.Found(AddressSuggestionMatch.Prefix, isRootHost ? 0 : 1);
+            }
+            // Long / sentence / delimited title
+            return MatchResult.Found(AddressSuggestionMatch.Prefix, 3);
         }
 
         if (HasWordPrefix(titleSpan, querySpan))
         {
-            return MatchResult.Found(AddressSuggestionMatch.Prefix, 1);
+            return MatchResult.Found(AddressSuggestionMatch.Prefix, IsNoisyTitle(titleSpan) ? 3 : 2);
         }
 
         if (UrlStartsWithInput(urlSpan, querySpan))
@@ -359,6 +426,193 @@ internal static class AddressSuggestionEngine
         }
 
         return MatchResult.None;
+    }
+
+    private static bool IsNoisyTitle(ReadOnlySpan<char> title)
+    {
+        if (title.Length > 60) return true;
+        if (title.IndexOf(" - ") >= 0 || title.IndexOf(" | ") >= 0)
+        {
+            if (title.Length > 35) return true;
+        }
+        return false;
+    }
+
+    private static bool TryExtractSearchEngineQuery(Uri uri, out string queryText, out string searchProviderName)
+    {
+        queryText = string.Empty;
+        searchProviderName = string.Empty;
+        var host = uri.IdnHost;
+        if (host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) host = host[4..];
+
+        if (host.Equals("google.com", StringComparison.OrdinalIgnoreCase)
+            || host.EndsWith(".google.com", StringComparison.OrdinalIgnoreCase)
+            || host.StartsWith("google.", StringComparison.OrdinalIgnoreCase))
+        {
+            if (uri.AbsolutePath.Equals("/search", StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryGetQueryParam(uri.Query, "q", out queryText) && !string.IsNullOrWhiteSpace(queryText))
+                {
+                    searchProviderName = "Google search";
+                    return true;
+                }
+            }
+        }
+        else if (host.Equals("bing.com", StringComparison.OrdinalIgnoreCase) || host.EndsWith(".bing.com", StringComparison.OrdinalIgnoreCase))
+        {
+            if (uri.AbsolutePath.Equals("/search", StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryGetQueryParam(uri.Query, "q", out queryText) && !string.IsNullOrWhiteSpace(queryText))
+                {
+                    searchProviderName = "Bing search";
+                    return true;
+                }
+            }
+        }
+        else if (host.Equals("duckduckgo.com", StringComparison.OrdinalIgnoreCase))
+        {
+            if (uri.AbsolutePath.Equals("/") || uri.AbsolutePath.Equals("/html", StringComparison.OrdinalIgnoreCase))
+            {
+                if (TryGetQueryParam(uri.Query, "q", out queryText) && !string.IsNullOrWhiteSpace(queryText))
+                {
+                    searchProviderName = "DuckDuckGo search";
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool TryGetQueryParam(string queryString, string paramName, out string value)
+    {
+        value = string.Empty;
+        if (string.IsNullOrEmpty(queryString)) return false;
+        var query = queryString.AsSpan();
+        if (query.StartsWith("?")) query = query[1..];
+
+        while (query.Length > 0)
+        {
+            var nextAmp = query.IndexOf('&');
+            var pair = nextAmp >= 0 ? query[..nextAmp] : query;
+            query = nextAmp >= 0 ? query[(nextAmp + 1)..] : ReadOnlySpan<char>.Empty;
+
+            var eqIndex = pair.IndexOf('=');
+            if (eqIndex <= 0) continue;
+            var key = pair[..eqIndex];
+            if (key.Equals(paramName.AsSpan(), StringComparison.OrdinalIgnoreCase))
+            {
+                var encodedVal = pair[(eqIndex + 1)..].ToString().Replace('+', ' ');
+                value = Uri.UnescapeDataString(encodedVal).Trim();
+                return value.Length > 0;
+            }
+        }
+        return false;
+    }
+
+    public static string? GetTopMatchHost(string query, BrowserState state)
+    {
+        if (string.IsNullOrWhiteSpace(query) || query.Length > 64 || state is null) return null;
+        var trimmed = query.Trim();
+        var candidates = GetIndexedCandidates(state);
+
+        IndexedCandidate? bestCandidate = null;
+        var bestQuality = int.MaxValue;
+
+        foreach (var c in candidates)
+        {
+            if (c.IsSearchQuery) continue;
+            var host = c.Host;
+            if (string.IsNullOrEmpty(host)) continue;
+
+            if (host.StartsWith(trimmed, StringComparison.OrdinalIgnoreCase))
+            {
+                var quality = (c.IsRootHost ? 0 : 1) * 100 - Math.Min(50, c.AcceptedCount * 10);
+                if (quality < bestQuality)
+                {
+                    bestQuality = quality;
+                    bestCandidate = c;
+                }
+            }
+        }
+
+        return bestCandidate?.Host;
+    }
+
+    public static IReadOnlyList<AddressSuggestion> MergeWithLiveSearch(
+        IReadOnlyList<AddressSuggestion> localSuggestions,
+        IReadOnlyList<string> liveQueries,
+        string query,
+        BrowserState state,
+        int maximumResults = MaximumResultLimit)
+    {
+        if (liveQueries is null || liveQueries.Count == 0)
+        {
+            return localSuggestions;
+        }
+
+        var limit = Math.Clamp(maximumResults, 1, MaximumResultLimit);
+        var searchProvider = BrowserPolicy.GetSearchProviderName(state?.SearchProviderId);
+        var baseSearchUrl = BrowserPolicy.CreateSearchUrl(query, state?.SearchProviderId);
+
+        var merged = new List<AddressSuggestion>(limit);
+        var seenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // 1. If localSuggestions has a TopMatch or Exact match, preserve it at position 0
+        var localIndex = 0;
+        if (localSuggestions.Count > 0 && !localSuggestions[0].IsSearch)
+        {
+            var first = localSuggestions[0];
+            merged.Add(first with { KeyboardIndex = 0 });
+            seenTargets.Add(first.AcceptText);
+            seenTargets.Add(first.Title);
+            localIndex = 1;
+        }
+
+        // 2. Add high-quality live search suggestions
+        var searchIndex = 0;
+        while (merged.Count < limit - 1 && searchIndex < liveQueries.Count)
+        {
+            var liveQuery = liveQueries[searchIndex++];
+            if (string.IsNullOrWhiteSpace(liveQuery)) continue;
+            var trimmedLive = liveQuery.Trim();
+            if (seenTargets.Contains(trimmedLive)) continue;
+            if (trimmedLive.Equals(query, StringComparison.OrdinalIgnoreCase)) continue;
+
+            seenTargets.Add(trimmedLive);
+            var liveSearchUrl = BrowserPolicy.CreateSearchUrl(trimmedLive, state?.SearchProviderId);
+            merged.Add(new AddressSuggestion(
+                merged.Count,
+                AddressSuggestionSource.Search,
+                AddressSuggestionMatch.Search,
+                trimmedLive,
+                $"{searchProvider} search",
+                trimmedLive,
+                liveSearchUrl));
+        }
+
+        // 3. Add remaining local candidates if there's room
+        while (merged.Count < limit - 1 && localIndex < localSuggestions.Count)
+        {
+            var local = localSuggestions[localIndex++];
+            if (local.IsSearch) continue;
+            if (seenTargets.Contains(local.AcceptText) || seenTargets.Contains(local.Title)) continue;
+
+            seenTargets.Add(local.AcceptText);
+            merged.Add(local with { KeyboardIndex = merged.Count });
+        }
+
+        // 4. Always ensure the bottom row is the primary search action for the user's typed input
+        var finalIndex = merged.Count;
+        merged.Add(new AddressSuggestion(
+            finalIndex,
+            AddressSuggestionSource.Search,
+            AddressSuggestionMatch.Search,
+            $"Search {searchProvider} for \u201c{CompactForDisplay(query)}\u201d",
+            $"{searchProvider} search",
+            query,
+            baseSearchUrl));
+
+        return merged;
     }
 
     private static int CompareCandidates(Candidate left, Candidate right)
@@ -574,7 +828,11 @@ internal static class AddressSuggestionEngine
         string Url,
         int UrlHash,
         int AcceptedCount,
-        DateTimeOffset LastAcceptedUtc);
+        DateTimeOffset LastAcceptedUtc,
+        bool IsSearchQuery,
+        string SearchProviderName,
+        string Host,
+        bool IsRootHost);
 
     private readonly record struct Candidate(
         AddressSuggestionSource Source,
@@ -585,7 +843,9 @@ internal static class AddressSuggestionEngine
         string Url,
         int AcceptedCount,
         DateTimeOffset LastAcceptedUtc,
-        int UrlHash);
+        int UrlHash,
+        bool IsSearchQuery = false,
+        string SearchProviderName = "");
 
     private static Dictionary<string, SuggestionUsageScore> BuildSuggestionUsageLookup(
         IReadOnlyList<AddressSuggestionUsage>? usageEntries)

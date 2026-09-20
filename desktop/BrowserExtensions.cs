@@ -14,7 +14,11 @@ internal sealed record PreparedBrowserExtension(
     string? StoreId,
     string? LaunchPath,
     IReadOnlyList<string> RequestedCapabilities,
-    bool IsManaged);
+    bool IsManaged,
+    string? PopupPath = null,
+    string? OptionsPath = null,
+    string? Description = null,
+    string? IconPath = null);
 
 internal sealed record ManagedBrowserExtension(
     string Id,
@@ -23,7 +27,11 @@ internal sealed record ManagedBrowserExtension(
     string Version,
     string? StoreId,
     string? LaunchPath,
-    IReadOnlyList<string>? RequestedCapabilities = null);
+    IReadOnlyList<string>? RequestedCapabilities = null,
+    string? PopupPath = null,
+    string? OptionsPath = null,
+    string? Description = null,
+    string? IconPath = null);
 
 internal sealed record PreparedBrowserExtensionUpdate(
     ManagedBrowserExtension Current,
@@ -464,7 +472,11 @@ internal sealed class BrowserExtensions
             prepared.Version,
             prepared.StoreId,
             prepared.LaunchPath,
-            prepared.RequestedCapabilities);
+            prepared.RequestedCapabilities,
+            prepared.PopupPath,
+            prepared.OptionsPath,
+            prepared.Description,
+            prepared.IconPath);
         ValidateManagedRecord(record);
         ManagedBrowserExtension? previous;
         lock (RegistrySync)
@@ -542,8 +554,13 @@ internal sealed class BrowserExtensions
                 try
                 {
                     var manifest = ReadManifest(candidate.PackageFolderPath);
-                    var storeId = candidate.Marker.StoreId is not null
-                        && candidate.Marker.StoreId.Equals(runtimeId, StringComparison.OrdinalIgnoreCase)
+                    var candidateIdentity = Path.GetFileName(Path.GetDirectoryName(candidate.PackageFolderPath));
+                    var storeId = (candidate.Marker.StoreId is not null
+                        && candidate.Marker.StoreId.Equals(runtimeId, StringComparison.OrdinalIgnoreCase))
+                        || (candidate.Marker.StoreId is null
+                            && candidateIdentity is not null
+                            && IsChromeExtensionId(candidateIdentity)
+                            && candidateIdentity.Equals(runtimeId, StringComparison.OrdinalIgnoreCase))
                             ? runtimeId
                             : null;
                     var adopted = new ManagedBrowserExtension(
@@ -553,7 +570,11 @@ internal sealed class BrowserExtensions
                         manifest.Version,
                         storeId,
                         manifest.LaunchPath,
-                        manifest.RequestedCapabilities);
+                        manifest.RequestedCapabilities,
+                        manifest.PopupPath,
+                        manifest.OptionsPath,
+                        manifest.Description,
+                        manifest.IconPath);
                     ValidateManagedRecord(adopted);
                     if (candidate.Marker.State != InstalledMarkerState
                         || !runtimeId.Equals(
@@ -564,6 +585,7 @@ internal sealed class BrowserExtensions
                             candidate.PackageFolderPath,
                             candidate.Marker with
                             {
+                                FormatVersion = 1,
                                 State = InstalledMarkerState,
                                 RuntimeId = runtimeId,
                                 StoreId = storeId,
@@ -912,7 +934,11 @@ internal sealed class BrowserExtensions
             storeId,
             manifest.LaunchPath,
             manifest.RequestedCapabilities,
-            IsManaged: true);
+            IsManaged: true,
+            manifest.PopupPath,
+            manifest.OptionsPath,
+            manifest.Description,
+            manifest.IconPath);
         var markerPath = GetManagedMarkerPath(finalPath);
         try
         {
@@ -1426,13 +1452,21 @@ internal sealed class BrowserExtensions
         {
             throw new InvalidDataException("Only Manifest V2 and Manifest V3 extensions are supported.");
         }
-        var launchPath = ReadLaunchPath(manifest);
+        var popupPath = ReadPopupPath(manifest);
+        var optionsPath = ReadOptionsPath(manifest);
+        var launchPath = popupPath ?? optionsPath;
+        var description = ReadDescription(manifest);
+        var iconPath = ReadBestIconPath(extensionRoot, manifest);
         return new ExtensionManifest(
             name,
             version,
             launchPath,
             ReadRequestedCapabilities(manifest),
-            manifest);
+            manifest,
+            popupPath,
+            optionsPath,
+            description,
+            iconPath);
     }
 
     private static IReadOnlyList<string> ReadRequestedCapabilities(JsonObject manifest)
@@ -1544,13 +1578,29 @@ internal sealed class BrowserExtensions
         return value.Trim();
     }
 
-    private static string? ReadLaunchPath(JsonObject manifest)
+    private static string? ReadPopupPath(JsonObject manifest)
     {
         var candidates = new[]
         {
             manifest["action"]?["default_popup"],
             manifest["browser_action"]?["default_popup"],
-            manifest["page_action"]?["default_popup"],
+            manifest["page_action"]?["default_popup"]
+        };
+        foreach (var candidate in candidates)
+        {
+            string? path;
+            try { path = candidate?.GetValue<string>(); }
+            catch (InvalidOperationException) { continue; }
+            path = NormalizeExtensionRelativePath(path);
+            if (path is not null) return path;
+        }
+        return null;
+    }
+
+    private static string? ReadOptionsPath(JsonObject manifest)
+    {
+        var candidates = new[]
+        {
             manifest["options_ui"]?["page"],
             manifest["options_page"]
         };
@@ -1561,6 +1611,66 @@ internal sealed class BrowserExtensions
             catch (InvalidOperationException) { continue; }
             path = NormalizeExtensionRelativePath(path);
             if (path is not null) return path;
+        }
+        return null;
+    }
+
+    private static string? ReadLaunchPath(JsonObject manifest) =>
+        ReadPopupPath(manifest) ?? ReadOptionsPath(manifest);
+
+    private static string? ReadDescription(JsonObject manifest)
+    {
+        try
+        {
+            var value = manifest["description"]?.GetValue<string>()?.Trim();
+            if (string.IsNullOrWhiteSpace(value)) return null;
+            return TextSafety.SanitizeSingleLine(value, 512);
+        }
+        catch { return null; }
+    }
+
+    private static string? ReadBestIconPath(string extensionRoot, JsonObject manifest)
+    {
+        var candidates = new List<string?>();
+        if (manifest["icons"] is JsonObject icons)
+        {
+            candidates.Add(icons["48"]?.GetValue<string>());
+            candidates.Add(icons["128"]?.GetValue<string>());
+            candidates.Add(icons["32"]?.GetValue<string>());
+            candidates.Add(icons["64"]?.GetValue<string>());
+            candidates.Add(icons["16"]?.GetValue<string>());
+            foreach (var kvp in icons)
+            {
+                try { candidates.Add(kvp.Value?.GetValue<string>()); } catch { }
+            }
+        }
+        var actionIcon = manifest["action"]?["default_icon"] ?? manifest["browser_action"]?["default_icon"];
+        if (actionIcon is JsonObject actionIcons)
+        {
+            candidates.Add(actionIcons["48"]?.GetValue<string>());
+            candidates.Add(actionIcons["32"]?.GetValue<string>());
+            candidates.Add(actionIcons["16"]?.GetValue<string>());
+            foreach (var kvp in actionIcons)
+            {
+                try { candidates.Add(kvp.Value?.GetValue<string>()); } catch { }
+            }
+        }
+        else if (actionIcon is JsonValue)
+        {
+            try { candidates.Add(actionIcon.GetValue<string>()); } catch { }
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) continue;
+            var normalized = NormalizeExtensionRelativePath(candidate);
+            if (normalized is null) continue;
+            try
+            {
+                var full = Path.Combine(extensionRoot, normalized.Replace('/', Path.DirectorySeparatorChar));
+                if (File.Exists(full)) return normalized;
+            }
+            catch { }
         }
         return null;
     }
@@ -1683,7 +1793,12 @@ internal sealed class BrowserExtensions
             || prepared.Name.Length > 512
             || string.IsNullOrWhiteSpace(prepared.Version)
             || prepared.Version.Length > 512
-            || (prepared.StoreId is not null && !IsChromeExtensionId(prepared.StoreId)))
+            || (prepared.StoreId is not null && !IsChromeExtensionId(prepared.StoreId))
+            || (prepared.LaunchPath is not null && prepared.LaunchPath.Length > 2_048)
+            || (prepared.PopupPath is not null && prepared.PopupPath.Length > 2_048)
+            || (prepared.OptionsPath is not null && prepared.OptionsPath.Length > 2_048)
+            || (prepared.Description is not null && prepared.Description.Length > 2_048)
+            || (prepared.IconPath is not null && prepared.IconPath.Length > 2_048))
         {
             throw new InvalidDataException("The prepared extension metadata is invalid.");
         }
@@ -1701,7 +1816,11 @@ internal sealed class BrowserExtensions
             || (record.StoreId is not null
                 && (!IsChromeExtensionId(record.StoreId)
                     || !record.StoreId.Equals(record.Id, StringComparison.OrdinalIgnoreCase)))
-            || (record.LaunchPath is not null && record.LaunchPath.Length > 2_048))
+            || (record.LaunchPath is not null && record.LaunchPath.Length > 2_048)
+            || (record.PopupPath is not null && record.PopupPath.Length > 2_048)
+            || (record.OptionsPath is not null && record.OptionsPath.Length > 2_048)
+            || (record.Description is not null && record.Description.Length > 2_048)
+            || (record.IconPath is not null && record.IconPath.Length > 2_048))
         {
             throw new InvalidDataException("The extension registry contains an invalid record.");
         }
@@ -2324,7 +2443,11 @@ internal sealed class BrowserExtensions
         string Version,
         string? LaunchPath,
         IReadOnlyList<string> RequestedCapabilities,
-        JsonObject Root);
+        JsonObject Root,
+        string? PopupPath = null,
+        string? OptionsPath = null,
+        string? Description = null,
+        string? IconPath = null);
 
     private sealed class ArchiveSegmentStream : Stream
     {

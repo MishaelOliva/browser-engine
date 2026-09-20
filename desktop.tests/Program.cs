@@ -1040,6 +1040,15 @@ Check(
     extensionOptions.AreBrowserExtensionsEnabled
         && extensionOptions.EnableTrackingPrevention
         && extensionOptions.ExclusiveUserDataFolderAccess);
+Check(
+    "browser environment options configure memory-saving Chromium arguments",
+    extensionOptions.AdditionalBrowserArguments is not null
+        && extensionOptions.AdditionalBrowserArguments.Contains("--enable-gpu-rasterization", StringComparison.Ordinal)
+        && extensionOptions.AdditionalBrowserArguments.Contains("--enable-zero-copy", StringComparison.Ordinal)
+        && extensionOptions.AdditionalBrowserArguments.Contains("--enable-features=CanvasOopRasterization,ParallelDownloading", StringComparison.Ordinal)
+        && extensionOptions.AdditionalBrowserArguments.Contains("--disable-features=BackForwardCache,SpareRendererForSitePerProcess,PeriodicBackgroundSync", StringComparison.Ordinal)
+        && extensionOptions.AdditionalBrowserArguments.Contains("--enable-quic", StringComparison.Ordinal)
+        && extensionOptions.AdditionalBrowserArguments.Contains("--enable-hardware-overlays=single-fullscreen,single-on-top", StringComparison.Ordinal));
 var normalProfileOptions = MainForm.GetControllerProfileSnapshotForTesting(isPrivateMode: false);
 var privateProfileOptions = MainForm.GetControllerProfileSnapshotForTesting(isPrivateMode: true);
 Check(
@@ -1424,6 +1433,36 @@ try
         "an installed package orphan is reclaimed only after its runtime ID is absent and the marker is stale",
         !Directory.Exists(inactiveOrphan.FolderPath)
             && !File.Exists(inactiveOrphan.FolderPath + ".misha-managed"));
+
+    var legacyMarkerStore = Path.Combine(extensionTestRoot, "legacy-marker-recovery");
+    const string legacyRuntimeId = "flpnibonbhdmnpgflnbemgghghhblmpm";
+    var legacyPackageFolder = Path.Combine(legacyMarkerStore, "Packages", legacyRuntimeId, "2.0.6-24aeec83");
+    Directory.CreateDirectory(legacyPackageFolder);
+    File.WriteAllText(
+        Path.Combine(legacyPackageFolder, "manifest.json"),
+        """
+        {
+          "manifest_version": 3,
+          "name": "Ghostify Test",
+          "version": "2.0.6",
+          "description": "Control your visibility",
+          "action": { "default_popup": "popup.html" },
+          "options_ui": { "page": "options.html" }
+        }
+        """);
+    File.WriteAllText(legacyPackageFolder + ".misha-managed", "MishaWeb managed extension package\n");
+    var legacyRecovery = new BrowserExtensions(legacyMarkerStore);
+    legacyRecovery.ReconcileManagedExtensions([legacyRuntimeId]);
+    var legacyRecord = legacyRecovery.GetManagedExtension(legacyRuntimeId);
+    Check(
+        "legacy marker package is successfully adopted with format version 1 and manifest pathways",
+        legacyRecord is not null
+            && legacyRecord.Id == legacyRuntimeId
+            && legacyRecord.StoreId == legacyRuntimeId
+            && legacyRecord.Version == "2.0.6"
+            && legacyRecord.PopupPath == "popup.html"
+            && legacyRecord.OptionsPath == "options.html"
+            && legacyRecord.Description == "Control your visibility");
 
     var zipBytes = CreateTestExtensionZip("CRX fixture", "2.0.0", "options.html");
     var publicKey = Encoding.ASCII.GetBytes("misha-web-extension-test-public-key");
@@ -2716,6 +2755,40 @@ Check(
 Check(
     "remote scriptlet syntax is never emitted as cosmetic CSS",
     !youtubeCosmeticCss.Contains("+js", StringComparison.Ordinal));
+Check(
+    "googlevideo requests always bypass adblocking regardless of top-level or path",
+    MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "about:blank",
+        sourceUrl: null,
+        requestUrl: "https://rr10---sn-bavcx-hoald.googlevideo.com/videoplayback?expire=1789883506&ei=test",
+        resourceType: AdBlockResourceType.Fetch)
+    && MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: null,
+        sourceUrl: "https://www.youtube.com/watch?v=0mNykxUtSGE",
+        requestUrl: "https://rr1---sn-aigzrnld.googlevideo.com/initplayback?source=youtube",
+        resourceType: AdBlockResourceType.Media)
+    && MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://example.com/embed",
+        sourceUrl: null,
+        requestUrl: "https://redirector.googlevideo.com/videometa",
+        resourceType: AdBlockResourceType.XmlHttpRequest));
+Check(
+    "youtube player and watch endpoints bypass adblocking",
+    MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://www.youtube.com/watch?v=0mNykxUtSGE",
+        sourceUrl: null,
+        requestUrl: "https://www.youtube.com/youtubei/v1/player?key=test",
+        resourceType: AdBlockResourceType.Fetch)
+    && MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "about:blank",
+        sourceUrl: "https://www.youtube.com/watch?v=0mNykxUtSGE",
+        requestUrl: "https://www.youtube.com/youtubei/v1/reel/reel_item_watch",
+        resourceType: AdBlockResourceType.XmlHttpRequest)
+    && !MainForm.ShouldBypassYouTubePlaybackRequest(
+        topLevelUrl: "https://www.youtube.com/watch?v=0mNykxUtSGE",
+        sourceUrl: null,
+        requestUrl: "https://www.youtube.com/pagead/adview",
+        resourceType: AdBlockResourceType.Fetch));
 
 var cosmeticInjectionEngine = new AdBlockEngine(initialRules:
 [
@@ -3149,6 +3222,7 @@ Check(
     "start-page logo probe releases its backdrop lease",
     backdropAfterLogoProbe.Leases == 0 && !backdropAfterLogoProbe.Allocated);
 Check("native start page constructs and lays out", CanConstructNativeStartPage());
+Check("native start page adapts layout and indicators for incognito mode", CanConfigureNativeStartPageForIncognitoMode());
 var backdropAfterConstructionProbe = StartPageArtwork.GetBackdropFrameStateForTesting();
 Check(
     $"standalone start-page disposal releases its backdrop lease ({backdropAfterConstructionProbe})",
@@ -3880,6 +3954,24 @@ Check(
         BrowserPerformance.NoMotionDocumentScript
         + Environment.NewLine
         + BrowserPerformance.RestoreMotionDocumentScript));
+Check(
+    "site responsiveness script is valid JavaScript and covers passive scroll, async decode, and hover preconnect",
+    CanParseJavaScript(BrowserPerformance.SiteResponsivenessDocumentScript)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("__mishaSiteResponsivenessInstalled", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("addEventListener", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("passive: true", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("decoding = 'async'", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("font-display: swap", StringComparison.Ordinal)
+        && BrowserPerformance.SiteResponsivenessDocumentScript.Contains("dns-prefetch", StringComparison.Ordinal));
+Check(
+    "browser environment options configure GPU rasterization, zero-copy, and network acceleration",
+    mainFormThemeSource.Contains("--enable-gpu-rasterization", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("--enable-zero-copy", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("CanvasOopRasterization", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("ParallelDownloading", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("BackForwardCache", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("--enable-quic", StringComparison.Ordinal)
+        && mainFormThemeSource.Contains("SiteResponsivenessDocumentScript", StringComparison.Ordinal));
 var adBlockDocumentScript = AdBlockEngine.DocumentScript;
 Check(
     "YouTube document shield covers desktop, mobile, and player ad surfaces",
@@ -4750,6 +4842,77 @@ Check(
     !BrowserPolicy.IsLegacyDuckDuckGoSearchUrl("https://duckduckgo.com/about")
         && BrowserPolicy.IsLegacyDuckDuckGoSearchUrl("https://duckduckgo.com/?q=burger&ia=web"));
 
+var chromeGradeState = new BrowserState
+{
+    Bookmarks =
+    [
+        new BookmarkEntry("YouTube", "https://www.youtube.com/"),
+        new BookmarkEntry("GitHub", "https://github.com/")
+    ],
+    History =
+    [
+        new HistoryEntry(
+            "Your application for the Junior Digital Developer role was not selected. - mishael.oliva2002@gmail.com - Gmail",
+            "https://mail.google.com/mail/u/0/#inbox/FMfcgzQhWLNrQMkkbBfvRXwrVZXWdhpl",
+            DateTime.UtcNow),
+        new HistoryEntry(
+            "gdrive - Google Search",
+            "https://www.google.com/search?q=gdrive",
+            DateTime.UtcNow),
+        new HistoryEntry(
+            "yt to mp3 320kbps - Google Search",
+            "https://www.google.com/search?q=yt%20to%20mp3%20320kbps",
+            DateTime.UtcNow)
+    ]
+};
+
+var ySuggestions = AddressSuggestionEngine.GetSuggestions("y", chromeGradeState);
+Check(
+    "host-first ranking elevates YouTube as Top Match over long email subjects",
+    ySuggestions.Count >= 3
+        && ySuggestions[0].Title == "YouTube"
+        && ySuggestions[0].NavigationTarget == "https://www.youtube.com/"
+        && ySuggestions[0].IsTopMatch
+        && ySuggestions[0].Match == AddressSuggestionMatch.Prefix
+        && ySuggestions[1].Title == "yt to mp3 320kbps"
+        && ySuggestions[1].IsSearchHistory
+        && ySuggestions[1].Detail == "Google search"
+        && ySuggestions[^1].IsSearch);
+
+var gSuggestions = AddressSuggestionEngine.GetSuggestions("g", chromeGradeState);
+Check(
+    "search query extraction cleans Google search history to clean search suggestions",
+    gSuggestions.Count >= 3
+        && gSuggestions[0].Title == "GitHub"
+        && gSuggestions[0].IsTopMatch
+        && gSuggestions[1].Title == "gdrive"
+        && gSuggestions[1].Detail == "Google search"
+        && gSuggestions[1].IsSearchHistory
+        && gSuggestions[1].AcceptText == "gdrive");
+
+Check(
+    "GetTopMatchHost returns domain for omnibox inline autocomplete",
+    AddressSuggestionEngine.GetTopMatchHost("y", chromeGradeState) == "youtube.com"
+        && AddressSuggestionEngine.GetTopMatchHost("git", chromeGradeState) == "github.com");
+
+var mergedLive = AddressSuggestionEngine.MergeWithLiveSearch(
+    ySuggestions,
+    ["youtube music", "yahoo", "yelp"],
+    "y",
+    chromeGradeState,
+    6);
+Check(
+    "MergeWithLiveSearch seamlessly integrates top match, live query suggestions, and search row",
+    mergedLive.Count == 6
+        && mergedLive[0].Title == "YouTube"
+        && mergedLive[0].IsTopMatch
+        && mergedLive[1].Title == "youtube music"
+        && mergedLive[1].IsSearch
+        && mergedLive[2].Title == "yahoo"
+        && mergedLive[3].Title == "yelp"
+        && mergedLive[^1].IsSearch
+        && mergedLive.Select((s, i) => s.KeyboardIndex == i).All(v => v));
+
 var nowUtc = new DateTime(2026, 7, 12, 12, 0, 0, DateTimeKind.Utc);
 const ulong OneGibibyte = 1024UL * 1024 * 1024;
 const int ModernLogicalProcessorCount = 8;
@@ -4766,6 +4929,16 @@ Check(
 Check(
     "logical processor classification survives an invalid memory snapshot",
     invalidMemorySnapshot.LogicalProcessorCount == 2 && invalidMemorySnapshot.IsLowSpecMachine);
+Check(
+    "current process working set trimming returns true on supported Windows hosts",
+    SystemResourceInfo.TrimCurrentProcessWorkingSet());
+Check(
+    "process working set trimming succeeds for the current process id",
+    SystemResourceInfo.TrimProcessWorkingSet(Environment.ProcessId));
+Check(
+    "process working set trimming rejects invalid or non-existent process ids safely",
+    !SystemResourceInfo.TrimProcessWorkingSet(-1)
+        && !SystemResourceInfo.TrimProcessWorkingSet(0));
 
 Check(
     "ultra resident budget is one on a four-GiB machine",
@@ -5608,6 +5781,48 @@ bool CanConstructNativeStartPage()
     thread.Start();
     thread.Join();
     return error is null && completedLayout;
+}
+
+bool CanConfigureNativeStartPageForIncognitoMode()
+{
+    Exception? error = null;
+    var verified = false;
+    var thread = new Thread(() =>
+    {
+        try
+        {
+            using var page = new NativeStartPage { Size = new Size(960, 560) };
+            page.SetPrivateMode(true);
+            page.CreateControl();
+            page.PerformLayout();
+            var descendants = GetDescendants(page).ToArray();
+            var titleLabel = descendants.OfType<Label>().FirstOrDefault(c => c.Text == "Incognito");
+            var taglineLabel = descendants.OfType<Label>().FirstOrDefault(c => c.Text.Contains("Incognito mode", StringComparison.OrdinalIgnoreCase));
+            var quickLinksVisible = descendants.Any(c => c.AccessibleName == "Quick links" && c.Visible);
+
+            var titleIsIncognito = titleLabel is not null && titleLabel.ForeColor == NativeUiTheme.Lavender;
+            var taglineIsVisible = taglineLabel is not null && taglineLabel.Visible;
+            var quickLinksHidden = !quickLinksVisible;
+
+            page.SetPrivateMode(false);
+            page.PerformLayout();
+            var revertedTitleOk = descendants.OfType<Label>().Any(c => c.Text == "MishaWeb");
+
+            verified = titleIsIncognito
+                && taglineIsVisible
+                && quickLinksHidden
+                && revertedTitleOk;
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+    })
+    { IsBackground = true };
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    return error is null && verified;
 }
 
 (bool Active24Bit, bool Released) VerifyBackdropFrameCacheLifecycle()
@@ -7587,6 +7802,29 @@ bool CanConstructFeatureSurfaces()
                 (_, _) => Task.CompletedTask,
                 () => { },
                 () => { });
+            using var extensionsWithRows = new ExtensionsManagerForm(
+                () => Task.FromResult<IReadOnlyList<ExtensionManagerRow>>([
+                    new ExtensionManagerRow(
+                        "flpnibonbhdmnpgflnbemgghghhblmpm",
+                        "Ghostify | Hide Seen, Typing & Story Views",
+                        "2.0.6",
+                        true,
+                        "popup.html",
+                        true,
+                        new object(),
+                        PopupPath: "popup.html",
+                        OptionsPath: "options.html",
+                        Description: "Control your visibility",
+                        StoreId: "flpnibonbhdmnpgflnbemgghghhblmpm",
+                        Capabilities: ["Permission: storage", "Site access: https://*.instagram.com/*"])
+                ]),
+                (_, _) => Task.CompletedTask,
+                (_, _) => Task.CompletedTask,
+                (_, _) => Task.CompletedTask,
+                (_, _) => Task.FromResult("Update check completed"),
+                (_, _) => Task.CompletedTask,
+                () => { },
+                () => { });
             palette.CreateControl();
             mru.CreateControl();
             sessions.CreateControl();
@@ -7594,13 +7832,15 @@ bool CanConstructFeatureSurfaces()
             permissions.CreateControl();
             downloads.CreateControl();
             extensions.CreateControl();
+            extensionsWithRows.CreateControl();
             constructed = palette.AccessibleName == "Command palette"
                 && mru.AccessibleName == "Recent tabs"
                 && sessions.AccessibleName == "Saved sessions manager"
                 && prompt.AccessibleName == "Website permission request"
                 && permissions.AccessibleName == "Website permission manager"
                 && downloads.AccessibleName == "Downloads"
-                && extensions.AccessibleName == "Browser extensions manager";
+                && extensions.AccessibleName == "Browser extensions manager"
+                && extensionsWithRows.AccessibleName == "Browser extensions manager";
         }
         catch (Exception caught)
         {

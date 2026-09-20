@@ -117,7 +117,7 @@ internal static class NativeUiTheme
         button.FlatAppearance.MouseDownBackColor = Pressed;
     }
 
-    private static void ApplyAccentButton(Button button)
+    internal static void ApplyAccentButton(Button button)
     {
         if (SystemInformation.HighContrast)
         {

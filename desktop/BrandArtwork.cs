@@ -119,15 +119,15 @@ internal sealed class BrandLogoControl : Control
             badgeSize,
             badgeSize);
         using var fill = new SolidBrush(
-            SystemInformation.HighContrast ? SystemColors.Highlight : NativeUiTheme.Accent);
+            SystemInformation.HighContrast ? SystemColors.Highlight : NativeUiTheme.Lavender);
         using var border = new Pen(
-            SystemInformation.HighContrast ? SystemColors.WindowText : NativeUiTheme.Focus,
+            SystemInformation.HighContrast ? SystemColors.WindowText : Color.FromArgb(120, 60, 148),
             1f);
         e.Graphics.FillEllipse(fill, badgeBounds);
         e.Graphics.DrawEllipse(border, badgeBounds);
         TextRenderer.DrawText(
             e.Graphics,
-            "P",
+            "I",
             Font,
             badgeBounds,
             SystemInformation.HighContrast ? SystemColors.HighlightText : NativeUiTheme.AccentText,

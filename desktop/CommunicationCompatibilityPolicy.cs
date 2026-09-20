@@ -15,7 +15,7 @@ internal static class CommunicationCompatibilityPolicy
 
     private static readonly string[][] ProviderTransportHosts =
     [
-        ["messenger.com", "facebook.com", "msngr.com", "facebook.net", "fbcdn.net"],
+        ["messenger.com", "facebook.com", "msngr.com", "facebook.net", "fbcdn.net", "fbsbx.com", "meta.com", "m.me", "tfbnw.net", "meta.ai", "fb.com"],
         ["discord.com", "discordapp.com", "discord.gg", "discord.media"],
         ["zoom.us", "zoom.com", "zoomgov.com", "zoomcdn.com"]
     ];
@@ -66,6 +66,46 @@ internal static class CommunicationCompatibilityPolicy
         return userKeepAwake || microphoneAccessGranted || cameraAccessGranted;
     }
 
+    public static bool IsProviderTransportHost(string? host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return false;
+        var normalized = host.TrimEnd('.');
+        for (var i = 0; i < ProviderTransportHosts.Length; i++)
+        {
+            if (ProviderTransportHosts[i].Any(root => HostMatches(normalized, root))) return true;
+        }
+        return false;
+    }
+
+    public static bool ShouldBypassCommunicationRequest(
+        string? topLevelUrl,
+        string? requestUrl,
+        AdBlockResourceType resourceType)
+    {
+        if (resourceType is not (AdBlockResourceType.WebSocket
+                or AdBlockResourceType.Media
+                or AdBlockResourceType.XmlHttpRequest
+                or AdBlockResourceType.Fetch
+                or AdBlockResourceType.Script
+                or AdBlockResourceType.Ping
+                or AdBlockResourceType.Other))
+        {
+            return false;
+        }
+
+        if (!TryGetProvider(topLevelUrl, out var provider)) return false;
+
+        if (string.IsNullOrWhiteSpace(requestUrl)
+            || !Uri.TryCreate(requestUrl, UriKind.Absolute, out var requestUri)
+            || requestUri.Scheme is not ("https" or "wss"))
+        {
+            return false;
+        }
+
+        var host = requestUri.IdnHost.TrimEnd('.');
+        return ProviderTransportHosts[provider].Any(root => HostMatches(host, root));
+    }
+
     public static bool IsTrustedPopup(
         string? sourceUrl,
         string? targetUrl)
@@ -92,8 +132,17 @@ internal static class CommunicationCompatibilityPolicy
     private static bool TryGetProvider(string? url, out int provider)
     {
         provider = -1;
-        if (string.IsNullOrWhiteSpace(url)
-            || !Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return false;
+        }
+
+        if (url.StartsWith("blob:", StringComparison.OrdinalIgnoreCase))
+        {
+            url = url[5..];
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
             || uri.Scheme != Uri.UriSchemeHttps
             || string.IsNullOrWhiteSpace(uri.Host))
         {

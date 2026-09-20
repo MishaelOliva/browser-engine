@@ -114,7 +114,13 @@ internal static class AdBlockDocumentScript
                     'ytd-rich-item-renderer:has(> #content > ytd-ad-slot-renderer)',
                     '#shorts-inner-container > .ytd-shorts:has(ytd-ad-slot-renderer)',
                     'ytm-companion-ad-renderer', 'ytm-companion-slot', 'ytm-promoted-sparkles-web-renderer',
-                    'ytm-rich-item-renderer:has(ad-slot-renderer)', 'ad-slot-renderer'
+                    'ytm-rich-item-renderer:has(ad-slot-renderer)', 'ad-slot-renderer',
+                    '.ytp-ad-player-overlay', '.ytp-ad-player-overlay-layout',
+                    '.ytp-ad-player-overlay-instream-info', '.ytp-ad-text',
+                    '.ytp-ad-preview-container', '.ytp-ad-action-interstitial',
+                    '.ytp-paid-content-overlay', 'ytd-merchandise-shelf-renderer',
+                    '.ytp-ad-player-overlay-flyout-cta', '.ytp-ad-survey',
+                    'ytd-ad-break-renderer', '.ytp-suggested-action'
                 );
             }
 
@@ -128,10 +134,13 @@ internal static class AdBlockDocumentScript
                 style.id = styleId;
                 style.textContent = selectors.join(',')
                     + '{display:none !important; visibility:hidden !important; min-height:0 !important;}'
+                    + '#cinematics canvas{will-change:transform; transform:translateZ(0);}'
+                    + 'tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), '
+                    + 'tp-yt-paper-dialog:has(yt-enforcement-message-view-model), '
+                    + 'tp-yt-paper-dialog:has(#enforcement-message)'
+                    + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
                     + `html[${recoveryMaskAttribute}] ytd-enforcement-message-view-model,`
-                    + `html[${recoveryMaskAttribute}] yt-enforcement-message-view-model,`
-                    + `html[${recoveryMaskAttribute}] tp-yt-paper-dialog:has(ytd-enforcement-message-view-model),`
-                    + `html[${recoveryMaskAttribute}] tp-yt-paper-dialog:has(yt-enforcement-message-view-model)`
+                    + `html[${recoveryMaskAttribute}] yt-enforcement-message-view-model`
                     + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}'
                     // A generic player error is hidden only after the strict
                     // transport-stall predicate verifies that a bounded retry is
@@ -143,11 +152,6 @@ internal static class AdBlockDocumentScript
                     + 'yt-playability-error-supported-renderers#error-screen'
                     + '{display:none !important; visibility:hidden !important; pointer-events:none !important;}';
                 document.documentElement.appendChild(style);
-                if (isYouTubeWatch() && !recoveryMaskActive) {
-                    // Pre-arm before the parser can paint a player error. The first
-                    // classified non-enforcement error removes this mask immediately.
-                    armRecoveryMask();
-                }
                 if (recoveryMaskActive) {
                     syncRecoveryMask();
                 }
@@ -168,6 +172,134 @@ internal static class AdBlockDocumentScript
             }
 
             if (!isYouTube || !isEnabled()) return;
+
+            // Avoid wrapping and traversing ordinary browse, search, comments,
+            // and account responses. Player-bearing endpoints are the only
+            // fetch/XHR payloads that need the deeper metadata sanitizer.
+            const playerPayloadPath = /\/(?:youtubei\/v1\/(?:player|get_watch)|youtubei\/v1\/reel\/(?:reel_watch_sequence|reel_item_watch)|get_video_info|playlist|watch)(?:[/?]|$)/;
+            const requestUrl = request => {
+                try {
+                    if (typeof request === 'string') return request;
+                    if (request && typeof request.url === 'string') return request.url;
+                    return request instanceof URL ? request.href : '';
+                } catch (_) { return ''; }
+            };
+            const shouldSanitizePlayerPayload = request => {
+                const value = requestUrl(request);
+                if (!value || !playerPayloadPath.test(value)) return false;
+                try {
+                    const target = new URL(value, location.href);
+                    return isYouTubeHost(target.hostname.toLowerCase())
+                        && playerPayloadPath.test(target.pathname);
+                } catch (_) { return false; }
+            };
+
+            const adKeys = new Set([
+                'adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams',
+                'adBreakParams', 'instreamAdPlayerOverlayRenderer',
+                'playerAdParams', 'adLayoutLoggingData', 'paidContentOverlayRenderer',
+                'adBreaks', 'adBreak', 'adSlotRenderer', 'adPlacementRenderer',
+                'adBreakServiceRenderer', 'instreamVideoAdRenderer',
+                'adSafetyReason', 'linearAdSequenceRenderer', 'playerLegacyDesktopWatchAdsRenderer',
+                'adBreakRenderer', 'adPlacement', 'videoAdRenderer'
+            ]);
+            const isAdEntry = value => !!value && typeof value === 'object' && (
+                value.adSlotRenderer
+                || value.richItemRenderer?.content?.adSlotRenderer
+                || value.command?.reelWatchEndpoint?.adClientParams?.isAd
+                || value.adPlacementRenderer
+                || value.adBreakServiceRenderer
+                || value.instreamVideoAdRenderer
+            );
+            const sanitizedObjects = new WeakSet();
+
+            const sanitize = value => {
+                if (!isEnabled()
+                    || !value
+                    || typeof value !== 'object'
+                    || sanitizedObjects.has(value)) return value;
+                const pending = [value];
+                const seen = new WeakSet();
+                let visited = 0;
+                while (pending.length && visited++ < 25000) {
+                    const current = pending.pop();
+                    if (!current
+                        || typeof current !== 'object'
+                        || seen.has(current)
+                        || sanitizedObjects.has(current)) continue;
+                    seen.add(current);
+
+                    if (Array.isArray(current)) {
+                        for (let index = current.length - 1; index >= 0; index--) {
+                            const item = current[index];
+                            if (isAdEntry(item)) {
+                                try { current.splice(index, 1); } catch (_) { }
+                            } else if (item && typeof item === 'object') {
+                                pending.push(item);
+                            }
+                        }
+                        continue;
+                    }
+
+                    for (const key of Object.keys(current)) {
+                        if (adKeys.has(key)) {
+                            try { delete current[key]; }
+                            catch (_) { try { current[key] = undefined; } catch (_) { } }
+                            continue;
+                        }
+                        const child = current[key];
+                        if (child && typeof child === 'object') pending.push(child);
+                    }
+                }
+                if (pending.length === 0) sanitizedObjects.add(value);
+                return value;
+            };
+
+            const isValidYouTubeVideoId = value => /^[A-Za-z0-9_-]{11}$/.test(value || '');
+            let serverRecoveryExhausted = false;
+
+            const repairPlayerResponse = obj => {
+                if (!isEnabled() || !obj || typeof obj !== 'object') return obj;
+                try {
+                    const playability = obj.playabilityStatus;
+                    if (playability && typeof playability === 'object') {
+                        const hasStreams = Boolean(
+                            (Array.isArray(obj.streamingData?.adaptiveFormats) && obj.streamingData.adaptiveFormats.length > 0)
+                            || (Array.isArray(obj.streamingData?.formats) && obj.streamingData.formats.length > 0)
+                        );
+                        const isEnforcement = playability.status === 'ERROR'
+                            || playability.status === 'UNPLAYABLE'
+                            || Boolean(playability.errorScreen?.enforcementMessageViewModel)
+                            || Boolean(playability.errorScreen?.playerErrorMessageRenderer);
+
+                        if (!obj.videoDetails && isYouTubeWatch()) {
+                            const vId = new URLSearchParams(location.search).get('v') || '';
+                            if (isValidYouTubeVideoId(vId)) {
+                                obj.videoDetails = { videoId: vId };
+                            }
+                        }
+
+                        if (serverRecoveryExhausted && hasStreams && (isEnforcement || playability.status !== 'OK')) {
+                            playability.status = 'OK';
+                            try { delete playability.errorScreen; } catch (_) { playability.errorScreen = undefined; }
+                            try { delete playability.reason; } catch (_) { playability.reason = undefined; }
+                            try { delete playability.subreason; } catch (_) { playability.subreason = undefined; }
+                            try { delete playability.messages; } catch (_) { playability.messages = undefined; }
+                        }
+                    }
+                } catch (_) { }
+                return obj;
+            };
+
+            const sanitizePayload = value => {
+                if (!isEnabled() || typeof value !== 'string') return value;
+                try {
+                    const parsed = JSON.parse(value);
+                    const sanitized = sanitize(parsed);
+                    repairPlayerResponse(sanitized);
+                    return JSON.stringify(sanitized);
+                } catch (_) { return value; }
+            };
 
             // Current uBO quick fixes disable YouTube's delayed network-machine
             // detector before it can replace an already-playable response with an
@@ -193,20 +325,50 @@ internal static class AdBlockDocumentScript
                     try { flags[name] = false; } catch (_) { }
                 }
             };
+            const forceTrueFlag = (flags, name) => {
+                if (!flags || typeof flags !== 'object') return;
+                try {
+                    const descriptor = Object.getOwnPropertyDescriptor(flags, name);
+                    if (descriptor && !descriptor.configurable) {
+                        flags[name] = true;
+                        return;
+                    }
+                    Object.defineProperty(flags, name, {
+                        configurable: true,
+                        enumerable: descriptor?.enumerable ?? true,
+                        get: () => true,
+                        set: () => {}
+                    });
+                } catch (_) {
+                    try { flags[name] = true; } catch (_) { }
+                }
+            };
             const patchExperimentFlags = flags => {
                 forceFalseFlag(flags, 'all_web_enable_network_machine');
                 forceFalseFlag(flags, 'all_web_network_machine_raw_request');
             };
-            const patchYtcfgData = data => {
-                if (!data || typeof data !== 'object' || patchedYtcfgData.has(data)) return;
-                patchedYtcfgData.add(data);
+            const sanitizePlayerVars = playerVars => {
+                if (!playerVars || typeof playerVars !== 'object') return;
                 try {
+                    for (const key of ['embedded_player_response', 'raw_player_response', 'player_response']) {
+                        if (typeof playerVars[key] === 'string') {
+                            playerVars[key] = sanitizePayload(playerVars[key]);
+                        } else if (typeof playerVars[key] === 'object') {
+                            playerVars[key] = sanitize(playerVars[key]);
+                        }
+                    }
+                } catch (_) { }
+            };
+            const patchYtcfgData = data => {
+                if (!data || typeof data !== 'object') return;
+                try {
+                    if (data.PLAYER_VARS) sanitizePlayerVars(data.PLAYER_VARS);
                     let storedFlags = data.EXPERIMENT_FLAGS;
                     const descriptor = Object.getOwnPropertyDescriptor(data, 'EXPERIMENT_FLAGS');
                     if (!descriptor || descriptor.configurable) {
                         Object.defineProperty(data, 'EXPERIMENT_FLAGS', {
                             configurable: true,
-                            enumerable: descriptor?.enumerable ?? true,
+                            enumerable: descriptor ? descriptor.enumerable : true,
                             get: () => storedFlags,
                             set: value => {
                                 storedFlags = value;
@@ -214,8 +376,10 @@ internal static class AdBlockDocumentScript
                             }
                         });
                     }
-                    patchExperimentFlags(storedFlags);
-                } catch (_) { patchExperimentFlags(data.EXPERIMENT_FLAGS); }
+                    if (storedFlags) patchExperimentFlags(storedFlags);
+                } catch (_) {
+                    if (data?.EXPERIMENT_FLAGS) patchExperimentFlags(data.EXPERIMENT_FLAGS);
+                }
             };
             const patchYtcfg = config => {
                 if (!config || typeof config !== 'object' || patchedYtcfgObjects.has(config)) return;
@@ -234,8 +398,33 @@ internal static class AdBlockDocumentScript
                             }
                         });
                     }
-                    patchYtcfgData(storedData);
-                } catch (_) { patchYtcfgData(config.data_); }
+                    if (storedData) patchYtcfgData(storedData);
+                    wrapYtcfgFn(config, 'set');
+                    wrapYtcfgFn(config, 'd');
+                } catch (_) { if (config.data_) patchYtcfgData(config.data_); }
+            };
+            const wrapYtcfgFn = (config, fnName) => {
+                try {
+                    const original = config?.[fnName];
+                    if (typeof original !== 'function' || original.__mishaHooked) return;
+                    const hooked = function(...args) {
+                        if (args[0] && typeof args[0] === 'object') {
+                            if (args[0].EXPERIMENT_FLAGS && typeof args[0].EXPERIMENT_FLAGS === 'object') {
+                                patchExperimentFlags(args[0].EXPERIMENT_FLAGS);
+                            }
+                            if (args[0].PLAYER_VARS) sanitizePlayerVars(args[0].PLAYER_VARS);
+                        } else if (typeof args[0] === 'string' && args[1] && typeof args[1] === 'object') {
+                            if (args[0] === 'EXPERIMENT_FLAGS') patchExperimentFlags(args[1]);
+                            if (args[0] === 'PLAYER_VARS') sanitizePlayerVars(args[1]);
+                        }
+                        const result = original.apply(this, args);
+                        if (config.data_?.PLAYER_VARS) sanitizePlayerVars(config.data_.PLAYER_VARS);
+                        if (config.data_?.EXPERIMENT_FLAGS) patchExperimentFlags(config.data_.EXPERIMENT_FLAGS);
+                        return result;
+                    };
+                    hooked.__mishaHooked = true;
+                    config[fnName] = hooked;
+                } catch (_) { }
             };
             try {
                 let storedYtcfg = window.ytcfg;
@@ -254,87 +443,131 @@ internal static class AdBlockDocumentScript
                 patchYtcfg(storedYtcfg);
             } catch (_) { patchYtcfg(window.ytcfg); }
 
-            // Avoid wrapping and traversing ordinary browse, search, comments,
-            // and account responses. Player-bearing endpoints are the only
-            // fetch/XHR payloads that need the deeper metadata sanitizer.
-            const playerPayloadPath = /\/(?:youtubei\/v1\/(?:player|get_watch)|youtubei\/v1\/reel\/(?:reel_watch_sequence|reel_item_watch)|get_video_info|playlist|watch)(?:[/?]|$)/;
-            const requestUrl = request => {
+            const trapYtPlayer = () => {
                 try {
-                    if (typeof request === 'string') return request;
-                    if (request && typeof request.url === 'string') return request.url;
-                    return request instanceof URL ? request.href : '';
-                } catch (_) { return ''; }
-            };
-            const shouldSanitizePlayerPayload = request => {
-                const value = requestUrl(request);
-                if (!value || !playerPayloadPath.test(value)) return false;
-                try {
-                    const target = new URL(value, location.href);
-                    return isYouTubeHost(target.hostname.toLowerCase())
-                        && playerPayloadPath.test(target.pathname);
-                } catch (_) { return false; }
-            };
-
-            const adKeys = new Set([
-                'adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams'
-            ]);
-            const isAdEntry = value => !!value && typeof value === 'object' && (
-                value.adSlotRenderer
-                || value.richItemRenderer?.content?.adSlotRenderer
-                || value.command?.reelWatchEndpoint?.adClientParams?.isAd
-            );
-            const sanitizedObjects = new WeakSet();
-
-            const sanitize = value => {
-                if (!isEnabled()
-                    || !value
-                    || typeof value !== 'object'
-                    || sanitizedObjects.has(value)) return value;
-                const pending = [value];
-                const seen = new WeakSet();
-                let visited = 0;
-                while (pending.length && visited++ < 25000) {
-                    const current = pending.pop();
-                    if (!current
-                        || typeof current !== 'object'
-                        || seen.has(current)
-                        || sanitizedObjects.has(current)) continue;
-                    seen.add(current);
-
-                    if (Array.isArray(current)) {
-                        for (let index = current.length - 1; index >= 0; index--) {
-                            const item = current[index];
-                            if (isAdEntry(item)) {
-                                current.splice(index, 1);
-                            } else if (item && typeof item === 'object') {
-                                pending.push(item);
+                    let storedYtPlayer = window.ytplayer;
+                    const patchYtPlayerObj = obj => {
+                        if (!obj || typeof obj !== 'object') return;
+                        try {
+                            let cfg = obj.config;
+                            const patchConfig = c => {
+                                if (!c || typeof c !== 'object') return;
+                                try {
+                                    let args = c.args;
+                                    const patchArgs = a => {
+                                        if (!a || typeof a !== 'object') return;
+                                        for (const key of ['player_response', 'raw_player_response', 'embedded_player_response']) {
+                                            if (typeof a[key] === 'string' && typeof sanitizePayload === 'function') {
+                                                a[key] = sanitizePayload(a[key]);
+                                            } else if (typeof a[key] === 'object' && typeof sanitize === 'function') {
+                                                a[key] = sanitize(a[key]);
+                                            }
+                                        }
+                                    };
+                                    const desc = Object.getOwnPropertyDescriptor(c, 'args');
+                                    if (!desc || desc.configurable) {
+                                        Object.defineProperty(c, 'args', {
+                                            configurable: true,
+                                            enumerable: desc?.enumerable ?? true,
+                                            get: () => args,
+                                            set: v => { args = v; patchArgs(v); }
+                                        });
+                                    }
+                                    patchArgs(args);
+                                } catch (_) { }
+                            };
+                            const cfgDesc = Object.getOwnPropertyDescriptor(obj, 'config');
+                            if (!cfgDesc || cfgDesc.configurable) {
+                                Object.defineProperty(obj, 'config', {
+                                    configurable: true,
+                                    enumerable: cfgDesc?.enumerable ?? true,
+                                    get: () => cfg,
+                                    set: v => { cfg = v; patchConfig(v); }
+                                });
                             }
-                        }
-                        continue;
+                            patchConfig(cfg);
+                        } catch (_) { }
+                    };
+                    const desc = Object.getOwnPropertyDescriptor(window, 'ytplayer');
+                    if (!desc || desc.configurable) {
+                        Object.defineProperty(window, 'ytplayer', {
+                            configurable: true,
+                            enumerable: desc?.enumerable ?? true,
+                            get: () => storedYtPlayer,
+                            set: v => { storedYtPlayer = v; patchYtPlayerObj(v); }
+                        });
                     }
+                    patchYtPlayerObj(storedYtPlayer);
+                } catch (_) { }
+            };
+            trapYtPlayer();
 
-                    for (const key of Object.keys(current)) {
-                        if (adKeys.has(key)) {
-                            try { delete current[key]; }
-                            catch (_) { try { current[key] = undefined; } catch (_) { } }
-                            continue;
-                        }
-                        const child = current[key];
-                        if (child && typeof child === 'object') pending.push(child);
+            const trapPopupConfig = yt => {
+                if (!yt || typeof yt !== 'object') return;
+                try {
+                    let config = yt.config_;
+                    const patchConfig = c => {
+                        if (!c || typeof c !== 'object') return;
+                        try {
+                            let openPopup = c.openPopupConfig;
+                            const patchOpenPopup = op => {
+                                if (!op || typeof op !== 'object') return;
+                                try {
+                                    let supported = op.supportedPopups;
+                                    const patchSupported = sp => {
+                                        if (!sp || typeof sp !== 'object') return;
+                                        try { forceFalseFlag(sp, 'adBlockMessageViewModel'); }
+                                        catch (_) { }
+                                    };
+                                    const spDesc = Object.getOwnPropertyDescriptor(op, 'supportedPopups');
+                                    if (!spDesc || spDesc.configurable) {
+                                        Object.defineProperty(op, 'supportedPopups', {
+                                            configurable: true,
+                                            enumerable: spDesc?.enumerable ?? true,
+                                            get: () => supported,
+                                            set: v => { supported = v; patchSupported(v); }
+                                        });
+                                    }
+                                    patchSupported(supported);
+                                } catch (_) { }
+                            };
+                            const opDesc = Object.getOwnPropertyDescriptor(c, 'openPopupConfig');
+                            if (!opDesc || opDesc.configurable) {
+                                Object.defineProperty(c, 'openPopupConfig', {
+                                    configurable: true,
+                                    enumerable: opDesc?.enumerable ?? true,
+                                    get: () => openPopup,
+                                    set: v => { openPopup = v; patchOpenPopup(v); }
+                                });
+                            }
+                            patchOpenPopup(openPopup);
+                        } catch (_) { }
+                    };
+                    const configDesc = Object.getOwnPropertyDescriptor(yt, 'config_');
+                    if (!configDesc || configDesc.configurable) {
+                        Object.defineProperty(yt, 'config_', {
+                            configurable: true,
+                            enumerable: configDesc?.enumerable ?? true,
+                            get: () => config,
+                            set: v => { config = v; patchConfig(v); }
+                        });
                     }
-                }
-                if (pending.length === 0) sanitizedObjects.add(value);
-                return value;
+                    patchConfig(config);
+                } catch (_) { }
             };
-
-            const sanitizePayload = value => {
-                if (!isEnabled() || typeof value !== 'string'
-                    || !/"(?:adPlacements|playerAds|adSlots|adSlotRenderer|adBreakHeartbeatParams)"/.test(value)) {
-                    return sanitize(value);
+            try {
+                let storedYt = window.yt;
+                const ytDesc = Object.getOwnPropertyDescriptor(window, 'yt');
+                if (!ytDesc || ytDesc.configurable) {
+                    Object.defineProperty(window, 'yt', {
+                        configurable: true,
+                        enumerable: ytDesc?.enumerable ?? true,
+                        get: () => storedYt,
+                        set: v => { storedYt = v; trapPopupConfig(v); }
+                    });
                 }
-                try { return JSON.stringify(sanitize(JSON.parse(value))); }
-                catch (_) { return value; }
-            };
+                trapPopupConfig(storedYt);
+            } catch (_) { trapPopupConfig(window.yt); }
 
             const getRecoveryContract = playerResponse => {
                 const videoId = playerResponse?.videoDetails?.videoId
@@ -355,12 +588,16 @@ internal static class AdBlockDocumentScript
                 const enforcement = errorScreen?.enforcementMessageViewModel;
                 const enforcementCommands = enforcement?.primaryButton?.onTap
                     ?.parallelCommand?.commands;
-                const exactAdBlockEnforcement = status?.status === 'ERROR'
+                const isExplicitEnforcement = status?.status === 'ERROR'
                     && enforcement
                     && enforcement.isVisible !== false
                     && (enforcementCommands?.some?.(command =>
                         command?.innertubeCommand?.openAdAllowlistInstructionCommand)
                         || /ad[ -]?block/i.test(enforcement.title?.content || ''));
+                const isGenericEnforcement = status?.status === 'ERROR'
+                    && !captcha
+                    && (!status?.reason || Boolean(enforcement));
+                const exactAdBlockEnforcement = isExplicitEnforcement || isGenericEnforcement;
                 return {
                     videoId,
                     status,
@@ -369,7 +606,6 @@ internal static class AdBlockDocumentScript
                 };
             };
             let pendingRecoverySignal = false;
-            let serverRecoveryExhausted = false;
             let queuePlayerRecovery = () => { pendingRecoverySignal = true; };
             const inspectPlayerResponse = playerResponse => {
                 const contract = getRecoveryContract(playerResponse);
@@ -378,30 +614,51 @@ internal static class AdBlockDocumentScript
                     if (serverRecoveryExhausted) return;
                     // Verify the exact model before hiding any YouTube error surface.
                     armRecoveryMask(true);
-                }
-                if (contract.exactAdBlockEnforcement || recoveryMaskActive) {
+                    queuePlayerRecovery();
+                } else if (contract.exactContractError) {
                     queuePlayerRecovery();
                 }
             };
 
             const trapGlobal = name => {
                 try {
-                    let stored = sanitize(window[name]);
+                    let stored = typeof window[name] === 'string'
+                        ? sanitizePayload(window[name])
+                        : sanitize(window[name]);
+                    inspectPlayerResponse(stored);
+                    if (stored && typeof stored === 'object') repairPlayerResponse(stored);
                     Object.defineProperty(window, name, {
                         configurable: true,
                         enumerable: true,
                         get: () => stored,
                         set: value => {
-                            stored = sanitize(value);
+                            stored = typeof value === 'string'
+                                ? sanitizePayload(value)
+                                : sanitize(value);
                             inspectPlayerResponse(stored);
+                            if (stored && typeof stored === 'object') repairPlayerResponse(stored);
                         }
                     });
-                    inspectPlayerResponse(stored);
                 } catch (_) { }
             };
             trapGlobal('ytInitialPlayerResponse');
-            trapGlobal('ytInitialData');
             trapGlobal('playerResponse');
+
+            try {
+                let storedInitialData = typeof window.ytInitialData === 'string'
+                    ? sanitizePayload(window.ytInitialData)
+                    : sanitize(window.ytInitialData);
+                Object.defineProperty(window, 'ytInitialData', {
+                    configurable: true,
+                    enumerable: true,
+                    get: () => storedInitialData,
+                    set: value => {
+                        storedInitialData = typeof value === 'string'
+                            ? sanitizePayload(value)
+                            : sanitize(value);
+                    }
+                });
+            } catch (_) { }
 
             const recoveryMarkers = ['channel', 'lactmilli'];
             let recoveryVideoId = '';
@@ -539,25 +796,33 @@ internal static class AdBlockDocumentScript
                 pendingRecoverySignal = false;
             };
             const rewritePlayerRequest = (url, bodyText) => {
+                const isPlayerTarget = /\/youtubei\/v1\/player(?:\?|$)/.test(url || '')
+                    || /\/youtubei\/v1\/(?:reel\/(?:reel_item_watch|reel_watch_sequence)|get_watch)(?:\?|$)/.test(url || '');
                 if (!isEnabled()
-                    || !activeRecoveryMarker
                     || typeof bodyText !== 'string'
-                    || !/\/youtubei\/v1\/player(?:\?|$)/.test(url || '')) return bodyText;
+                    || !bodyText.trim()
+                    || !isPlayerTarget) return bodyText;
                 try {
                     const body = JSON.parse(bodyText);
                     const client = body?.context?.client;
-                    if (!body || !client) return bodyText;
-                    if (activeRecoveryMarker === 'channel') client.clientScreen = 'CHANNEL';
-                    if (activeRecoveryMarker === 'lactmilli') {
-                        body.params = '8AUB';
-                        const playback = body.playbackContext?.contentPlaybackContext;
-                        if (playback) playback.lactMilliseconds = String(Date.now());
+                    if (!body || typeof body !== 'object') return bodyText;
+                    let mutated = false;
+                    if (client && activeRecoveryMarker === 'channel') {
+                        client.clientScreen = 'CHANNEL';
+                        mutated = true;
                     }
-                    if (typeof client.referer === 'string'
+                    const playback = body.playbackContext?.contentPlaybackContext;
+                    if (playback && (activeRecoveryMarker === 'lactmilli' || !playback.lactMilliseconds)) {
+                        playback.lactMilliseconds = String(Date.now());
+                        mutated = true;
+                    }
+                    if (client && typeof client.referer === 'string'
+                        && activeRecoveryMarker
                         && !client.referer.includes('#reloadxhr')) {
                         client.referer += '#reloadxhr';
+                        mutated = true;
                     }
-                    return JSON.stringify(body);
+                    return mutated ? JSON.stringify(body) : bodyText;
                 } catch (_) { return bodyText; }
             };
 
@@ -571,12 +836,24 @@ internal static class AdBlockDocumentScript
                     const nativeJson = response.json.bind(response);
                     Object.defineProperty(response, 'json', {
                         configurable: true,
-                        value: (...args) => nativeJson(...args).then(sanitize)
+                        value: (...args) => nativeJson(...args).then(res => {
+                            const sanitized = sanitize(res);
+                            repairPlayerResponse(sanitized);
+                            inspectPlayerResponse(sanitized);
+                            return sanitized;
+                        })
                     });
                     const nativeText = response.text.bind(response);
                     Object.defineProperty(response, 'text', {
                         configurable: true,
-                        value: (...args) => nativeText(...args).then(sanitizePayload)
+                        value: (...args) => nativeText(...args).then(text => {
+                            const sanitizedText = sanitizePayload(text);
+                            try {
+                                const parsed = JSON.parse(sanitizedText);
+                                inspectPlayerResponse(parsed);
+                            } catch (_) { }
+                            return sanitizedText;
+                        })
                     });
                     const nativeClone = response.clone.bind(response);
                     Object.defineProperty(response, 'clone', {
@@ -593,11 +870,45 @@ internal static class AdBlockDocumentScript
                 window.fetch = new Proxy(nativeFetch, {
                     apply(target, thisArg, args) {
                         try {
-                            const url = requestUrl(args[0]);
+                            const firstArg = args[0];
+                            const isReq = typeof Request !== 'undefined' && firstArg instanceof Request;
+                            const url = isReq ? firstArg.url : requestUrl(firstArg);
+                            if (isReq && shouldSanitizePlayerPayload(firstArg)) {
+                                return (async () => {
+                                    try {
+                                        const bodyText = await firstArg.clone().text();
+                                        const rewritten = rewritePlayerRequest(url, bodyText);
+                                        if (rewritten && rewritten !== bodyText) {
+                                            const headers = new Headers(firstArg.headers);
+                                            if (!headers.has('Content-Type')) {
+                                                headers.set('Content-Type', 'application/json');
+                                            }
+                                            const init = {
+                                                method: firstArg.method,
+                                                headers: headers,
+                                                mode: firstArg.mode,
+                                                credentials: firstArg.credentials,
+                                                cache: firstArg.cache,
+                                                redirect: firstArg.redirect,
+                                                referrer: firstArg.referrer,
+                                                integrity: firstArg.integrity,
+                                                body: rewritten
+                                            };
+                                            const newReq = new Request(firstArg.url, init);
+                                            const response = await Reflect.apply(target, thisArg, [newReq]);
+                                            return patchResponse(response, newReq);
+                                        }
+                                    } catch (_) { }
+                                    const res = await Reflect.apply(target, thisArg, args);
+                                    return patchResponse(res, firstArg);
+                                })();
+                            }
                             const body = args[1]?.body;
-                            const rewrittenBody = rewritePlayerRequest(url, body);
-                            if (rewrittenBody !== body) {
-                                args[1] = { ...(args[1] || {}), body: rewrittenBody };
+                            if (typeof body === 'string') {
+                                const rewrittenBody = rewritePlayerRequest(url, body);
+                                if (rewrittenBody !== body) {
+                                    args[1] = { ...(args[1] || {}), body: rewrittenBody };
+                                }
                             }
                         } catch (_) { }
                         const pending = Reflect.apply(target, thisArg, args);
@@ -655,7 +966,19 @@ internal static class AdBlockDocumentScript
                             if (shouldSanitizePlayerPayload(url)) {
                                 thisArg.addEventListener(
                                     'load',
-                                    () => sanitize(thisArg.response),
+                                    () => {
+                                        try {
+                                            const raw = thisArg.response;
+                                            const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                                            const res = sanitize(obj);
+                                            repairPlayerResponse(res);
+                                            inspectPlayerResponse(res);
+                                        } catch (_) {
+                                            const res = sanitize(thisArg.response);
+                                            repairPlayerResponse(res);
+                                            inspectPlayerResponse(res);
+                                        }
+                                    },
                                     { once: true });
                             }
                         } catch (_) { }
@@ -715,7 +1038,13 @@ internal static class AdBlockDocumentScript
             const skipSelectors = [
                 '.ytp-ad-skip-button', '.ytp-ad-skip-button-modern',
                 '.ytp-skip-ad-button', '.ytp-skip-ad-button-modern',
-                '.ytp-ad-overlay-close-button'
+                '.ytp-ad-overlay-close-button',
+                'button.ytp-ad-skip-button-modern',
+                'button.ytp-ad-skip-button',
+                '.ytp-ad-skip-button-container button',
+                '.ytp-ad-skip-button-slot > button',
+                '.ytp-ad-skip-button-text',
+                '[id^="skip-button:"] button'
             ];
 
             const maybeRecoverServerContract = (player, playerResponse) => {
@@ -726,7 +1055,8 @@ internal static class AdBlockDocumentScript
 
                 const contract = getRecoveryContract(playerResponse);
                 const { status, exactContractError, exactAdBlockEnforcement } = contract;
-                const videoId = getMatchingWatchVideoId(playerResponse);
+                const isEnforcement = exactContractError || exactAdBlockEnforcement;
+                const videoId = getMatchingWatchVideoId(playerResponse, isEnforcement);
                 if ((exactContractError || exactAdBlockEnforcement) && !videoId) {
                     if (activeRecoveryMarkerOwner === 'server') setRecoveryMarker('');
                     clearRecoveryMask();
@@ -797,6 +1127,7 @@ internal static class AdBlockDocumentScript
                         : recoveryAttempt + 1;
                     serverRecoveryExhausted = recoveryAttempt >= recoveryMarkers.length;
                     player.loadVideoById(videoId, startSeconds);
+                    try { player.playVideo(); } catch (_) { }
                     return true;
                 } catch (_) {
                     if (responseCanBeTracked) seenRecoveryResponses.delete(playerResponse);
@@ -807,7 +1138,7 @@ internal static class AdBlockDocumentScript
                 }
             };
 
-            const transportRetryPattern = /this content isn['’]?t available[,.]?\s*try again later/i;
+            const transportRetryPattern = /(?:this content isn['’]?t available|an error occurred)[,.]?\s*try again later/i;
             const textFromRuns = runs => Array.isArray(runs)
                 ? runs.map(run => run?.text || '').join(' ')
                 : '';
@@ -830,7 +1161,7 @@ internal static class AdBlockDocumentScript
                     return true;
                 }
                 const candidates = document.querySelectorAll(
-                    '.ytp-error, .ytp-error-content-wrap, .ytp-error-content, '
+                    '.ytp-error, .ytp-error-content-wrap, .ytp-error-content, .ytp-error-message, '
                     + 'yt-playability-error-supported-renderers#error-screen');
                 for (const candidate of candidates) {
                     try {
@@ -849,7 +1180,8 @@ internal static class AdBlockDocumentScript
                         }
                     } catch (_) { }
                 }
-                return !!document.querySelector('ytd-watch-flexy[player-unavailable]')
+                return (!!document.querySelector('ytd-watch-flexy[player-unavailable]')
+                    || !!document.querySelector('.ytp-error'))
                     && transportRetryPattern.test(getTransportResponseText(playerResponse));
             };
 
@@ -864,10 +1196,11 @@ internal static class AdBlockDocumentScript
                 }
             };
 
-            const isValidYouTubeVideoId = value => /^[A-Za-z0-9_-]{11}$/.test(value || '');
-            const getMatchingWatchVideoId = playerResponse => {
+            const getMatchingWatchVideoId = (playerResponse, allowRequestedFallback = false) => {
                 const requested = new URLSearchParams(location.search).get('v') || '';
-                const response = playerResponse?.videoDetails?.videoId || '';
+                const response = playerResponse?.videoDetails?.videoId
+                    || window.ytInitialPlayerResponse?.videoDetails?.videoId
+                    || (allowRequestedFallback ? requested : '');
                 return isValidYouTubeVideoId(requested)
                     && isValidYouTubeVideoId(response)
                     && requested === response
@@ -1026,22 +1359,122 @@ internal static class AdBlockDocumentScript
                 }
             };
 
+            let adWasActive = false;
+            let userPlaybackRate = 1.0;
+            let userWasMuted = false;
+            let userManuallyPaused = false;
+            let activeWatchVideoId = '';
+            let autoplayAttempts = 0;
+            let autoplayCompletedForVideoId = '';
+            let lastPlayAttempt = 0;
+            let watchPageLoadTime = performance.now();
+            let hookedVideo = null;
+            let removeVideoHooks = () => {};
+
+            const getActiveVideo = () => {
+                const player = document.getElementById?.('movie_player') || document.querySelector?.('.html5-video-player');
+                const v = player?.querySelector?.('video.html5-main-video')
+                    || player?.querySelector?.('video')
+                    || document.querySelector?.('video.html5-main-video, video');
+                if (v && v.isConnected && v !== hookedVideo) {
+                    hookVideoElement(v);
+                }
+                return v;
+            };
+
+            const triggerInstantPlay = () => {
+                if (!isEnabled() || !isYouTubeWatch() || userManuallyPaused) return;
+                const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                if (!currentVideoId) return;
+
+                if (currentVideoId !== activeWatchVideoId) {
+                    activeWatchVideoId = currentVideoId;
+                    autoplayAttempts = 0;
+                    autoplayCompletedForVideoId = '';
+                    userManuallyPaused = false;
+                    lastPlayAttempt = 0;
+                }
+
+                if (autoplayCompletedForVideoId === currentVideoId) return;
+
+                const player = document.getElementById?.('movie_player') || document.querySelector?.('.html5-video-player');
+                if (!player) return;
+
+                const isAd = Boolean(
+                    player.classList?.contains?.('ad-showing')
+                    || player.classList?.contains?.('ad-interrupting')
+                );
+                if (isAd) return;
+
+                const video = getActiveVideo();
+
+                let playerState = null;
+                try {
+                    if (typeof player.getPlayerState === 'function') {
+                        playerState = player.getPlayerState();
+                    }
+                } catch (_) { }
+
+                // YouTube player states:
+                // -1: unstarted, 0: ended, 1: playing, 2: paused, 3: buffering, 5: video cued
+                if (playerState === 1 || (video && !video.paused && (video.currentTime || 0) > 0)) {
+                    autoplayCompletedForVideoId = currentVideoId;
+                    return;
+                }
+                const hasMediaAttached = Boolean(video && (video.src || video.currentSrc) && video.readyState >= 1);
+                if (playerState === 3 && hasMediaAttached && video && !video.paused) {
+                    // Buffering active stream while playing - do not disrupt
+                    return;
+                }
+
+                // If video has media attached (readyState >= 1 or src), declare play intent immediately!
+                const hasMedia = Boolean(video && (video.readyState >= 1 || video.src || video.currentSrc));
+                if (!video || !hasMedia) {
+                    if (playerState === -1 || playerState === 5) {
+                        const now = performance.now();
+                        if (now - lastPlayAttempt >= 300) {
+                            lastPlayAttempt = now;
+                            try { player.playVideo(); } catch (_) { }
+                        }
+                    }
+                    return;
+                }
+
+                if (autoplayAttempts >= 20) return;
+                autoplayAttempts++;
+
+                const isPausedOrCued = playerState === -1 || playerState === 2 || playerState === 5;
+                const isPausedVideo = Boolean(video.paused);
+
+                if (isPausedOrCued || isPausedVideo) {
+                    const now = performance.now();
+                    if (now - lastPlayAttempt < 150) return;
+                    lastPlayAttempt = now;
+                    try {
+                        if (typeof player.playVideo === 'function') {
+                            player.playVideo();
+                        }
+                    } catch (_) { }
+                    try {
+                        if (video.paused) {
+                            const playPromise = video.play();
+                            if (playPromise && typeof playPromise.catch === 'function') {
+                                playPromise.catch(() => {});
+                            }
+                        }
+                    } catch (_) { }
+                }
+            };
+
             const cleanPlayerAds = () => {
                 if (!isEnabled()) return false;
                 let adActivity = false;
                 try {
-                    for (const selector of skipSelectors) {
-                        const button = document.querySelector(selector);
-                        if (button instanceof HTMLElement) {
-                            button.click();
-                            adActivity = true;
-                        }
-                    }
-
                     const player = document.getElementById('movie_player');
                     const playerResponse = player?.getPlayerResponse?.()
                         || window.ytInitialPlayerResponse;
                     if (maybeRecoverServerContract(player, playerResponse)) return true;
+                    if (playerResponse) repairPlayerResponse(playerResponse);
 
                     // Apply the current uBO SSAP gate only to non-Premium watch pages.
                     const progress = player?.getProgressState?.();
@@ -1074,34 +1507,67 @@ internal static class AdBlockDocumentScript
                         || player?.classList?.contains('ad-interrupting');
                     if (isClientAd) {
                         adActivity = true;
-                        const video = document.querySelector('video.html5-main-video, video');
-                        if (video instanceof HTMLVideoElement
-                            && Number.isFinite(video.duration)
-                            && video.duration > 0) {
-                            const wasMuted = video.muted;
-                            video.muted = true;
-                            video.currentTime = video.duration;
-                            queueMicrotask(() => { video.muted = wasMuted; });
+                        try { player?.mute?.(); } catch (_) { }
+                        const videos = document.querySelectorAll('video.html5-main-video, video');
+                        for (const video of videos) {
+                            if (!(video instanceof HTMLVideoElement)) continue;
+                            if (!adWasActive) {
+                                adWasActive = true;
+                                userWasMuted = video.muted;
+                            }
+                            try { video.muted = true; } catch (_) { }
+                            try {
+                                if (video.playbackRate < 16) {
+                                    video.playbackRate = 16;
+                                }
+                            } catch (_) { }
                         }
+                        for (const selector of skipSelectors) {
+                            try {
+                                const button = document.querySelector(selector);
+                                if (button instanceof HTMLElement) {
+                                    button.click();
+                                }
+                            } catch (_) { }
+                        }
+                        try { player?.skipAd?.(); } catch (_) { }
+                    } else if (adWasActive) {
+                        adWasActive = false;
+                        const videos = document.querySelectorAll('video.html5-main-video, video');
+                        for (const video of videos) {
+                            if (!(video instanceof HTMLVideoElement)) continue;
+                            try {
+                                if (video.playbackRate > 2) video.playbackRate = userPlaybackRate || 1.0;
+                            } catch (_) { }
+                            try { video.muted = userWasMuted; } catch (_) { }
+                        }
+                        try {
+                            if (!userWasMuted) player?.unMute?.();
+                        } catch (_) { }
+                        try { player?.playVideo?.(); } catch (_) { }
                     }
 
                     const enforcement = document.querySelector(
-                        'ytd-enforcement-message-view-model, yt-enforcement-message-view-model');
+                        'ytd-enforcement-message-view-model, yt-enforcement-message-view-model, '
+                        + 'tp-yt-paper-dialog:has(ytd-enforcement-message-view-model), '
+                        + 'tp-yt-paper-dialog:has(yt-enforcement-message-view-model), '
+                        + 'tp-yt-paper-dialog:has(#enforcement-message)');
+                    if (enforcement) {
+                        adActivity = true;
+                        const owner = enforcement.closest?.(
+                            'tp-yt-paper-dialog, yt-playability-error-supported-renderers#error-screen');
+                        (owner || enforcement).remove?.();
+                        document.querySelector('tp-yt-iron-overlay-backdrop')?.remove();
+                        player?.classList?.remove?.('ytp-transparent');
+                        document.querySelector('ytd-watch-flexy[player-unavailable]')
+                            ?.removeAttribute('player-unavailable');
+                        player?.playVideo?.();
+                    }
+
                     const playbackReady = playerResponse?.playabilityStatus?.status === 'OK'
                         && recoveredVideo instanceof HTMLVideoElement
                         && recoveredVideo.readyState > 0;
                     if (playbackReady) {
-                        if (enforcement) {
-                            adActivity = true;
-                            const owner = enforcement.closest?.(
-                                'tp-yt-paper-dialog, yt-playability-error-supported-renderers#error-screen');
-                            (owner || enforcement).remove?.();
-                            document.querySelector('tp-yt-iron-overlay-backdrop')?.remove();
-                            player?.classList?.remove?.('ytp-transparent');
-                            document.querySelector('ytd-watch-flexy[player-unavailable]')
-                                ?.removeAttribute('player-unavailable');
-                            player?.playVideo?.();
-                        }
                         if (!recoveryMaskVerified || mediaProgressing) {
                             clearRecoveryMask();
                         }
@@ -1110,6 +1576,17 @@ internal static class AdBlockDocumentScript
                     if (popupConfig && popupConfig.adBlockMessageViewModel !== false) {
                         popupConfig.adBlockMessageViewModel = false;
                         adActivity = true;
+                    }
+                    if (isYouTubeWatch()) {
+                        const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                        if (currentVideoId && currentVideoId !== activeWatchVideoId) {
+                            activeWatchVideoId = currentVideoId;
+                            autoplayAttempts = 0;
+                            autoplayCompletedForVideoId = '';
+                            userManuallyPaused = false;
+                            lastPlayAttempt = 0;
+                        }
+                        if (!autoplayCompletedForVideoId) triggerInstantPlay();
                     }
                 } catch (_) { }
                 return adActivity;
@@ -1124,7 +1601,71 @@ internal static class AdBlockDocumentScript
             let playerObserver = null;
             let playerBootstrapObserver = null;
             let playerBootstrapTimer = 0;
+            const hookVideoElement = video => {
+                if (!video || typeof video.addEventListener !== 'function' || typeof video.removeEventListener !== 'function' || video === hookedVideo) return;
+                removeVideoHooks();
+                hookedVideo = video;
+                const onPlay = () => {
+                    const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                    if (currentVideoId) autoplayCompletedForVideoId = currentVideoId;
+                    cleanPlayerAds();
+                };
+                const onPlaying = () => {
+                    const currentVideoId = new URLSearchParams(location.search).get('v') || '';
+                    if (currentVideoId) autoplayCompletedForVideoId = currentVideoId;
+                };
+                const onReady = () => {
+                    cleanPlayerAds();
+                    if (!autoplayCompletedForVideoId && !userManuallyPaused) {
+                        autoplayAttempts = 0;
+                        triggerInstantPlay();
+                    }
+                };
+                const onRateChange = () => {
+                    const player = observedPlayer || document.getElementById('movie_player');
+                    if (!player?.classList?.contains('ad-showing')
+                        && !player?.classList?.contains('ad-interrupting')
+                        && video.playbackRate <= 2) {
+                        userPlaybackRate = video.playbackRate;
+                    }
+                };
+                const onVolumeChange = () => {
+                    const player = observedPlayer || document.getElementById('movie_player');
+                    if (!player?.classList?.contains('ad-showing')
+                        && !player?.classList?.contains('ad-interrupting')) {
+                        userWasMuted = video.muted;
+                    }
+                };
+                video.addEventListener('play', onPlay, { passive: true });
+                video.addEventListener('playing', onPlaying, { passive: true });
+                video.addEventListener('loadedmetadata', onReady, { passive: true });
+                video.addEventListener('loadeddata', onReady, { passive: true });
+                video.addEventListener('canplay', onReady, { passive: true });
+                video.addEventListener('canplaythrough', onReady, { passive: true });
+                video.addEventListener('ratechange', onRateChange, { passive: true });
+                video.addEventListener('volumechange', onVolumeChange, { passive: true });
+                removeVideoHooks = () => {
+                    video.removeEventListener('play', onPlay);
+                    video.removeEventListener('playing', onPlaying);
+                    video.removeEventListener('loadedmetadata', onReady);
+                    video.removeEventListener('loadeddata', onReady);
+                    video.removeEventListener('canplay', onReady);
+                    video.removeEventListener('canplaythrough', onReady);
+                    video.removeEventListener('ratechange', onRateChange);
+                    video.removeEventListener('volumechange', onVolumeChange);
+                    if (hookedVideo === video) hookedVideo = null;
+                };
+            };
             const cleanupEvents = ['yt-page-data-updated', 'yt-player-updated'];
+            let instantPlayTimer = 0;
+            const scheduleInstantPlayCheck = () => {
+                window.clearTimeout(instantPlayTimer);
+                if (!isEnabled() || !isYouTubeWatch() || autoplayCompletedForVideoId || userManuallyPaused) return;
+                triggerInstantPlay();
+                if (!autoplayCompletedForVideoId) {
+                    instantPlayTimer = window.setTimeout(scheduleInstantPlayCheck, 200);
+                }
+            };
             const scheduleFallback = adActivity => {
                 window.clearTimeout(fallbackTimer);
                 if (!isEnabled()) return;
@@ -1132,9 +1673,10 @@ internal static class AdBlockDocumentScript
                     && performance.now() < transportRecoveryFastPollUntil;
                 const delay = document.hidden
                     ? 30_000
-                    : (fastRecoveryPoll ? 250 : (adActivity ? 500 : 5_000));
+                    : (fastRecoveryPoll ? 250 : (adActivity ? 500 : 3_000));
                 fallbackTimer = window.setTimeout(() => {
                     const activity = cleanPlayerAds();
+                    if (!autoplayCompletedForVideoId) scheduleInstantPlayCheck();
                     observePlayer();
                     scheduleFallback(activity);
                 }, delay);
@@ -1176,9 +1718,11 @@ internal static class AdBlockDocumentScript
                     playerObserver?.disconnect();
                     observedPlayer = null;
                     stopPlayerBootstrapObservation();
+                    removeVideoHooks();
                     return;
                 }
                 const player = document.getElementById('movie_player');
+                hookVideoElement(document.querySelector('video.html5-main-video, video'));
                 if (player === observedPlayer) return;
                 playerObserver?.disconnect();
                 observedPlayer = player;
@@ -1188,14 +1732,18 @@ internal static class AdBlockDocumentScript
                         attributes: true,
                         attributeFilter: ['class']
                     });
+                    queueUrgentCleanup();
                 }
             };
             const startPlayerBootstrapObservation = () => {
                 if (!isEnabled() || observedPlayer || playerBootstrapObserver
-                    || !document.documentElement) return;
+                    || !document.documentElement || !isYouTubeWatch()) return;
                 playerBootstrapObserver = new MutationObserver(() => {
                     observePlayer();
-                    if (observedPlayer) queueCleanup();
+                    if (observedPlayer) {
+                        cleanPlayerAds();
+                        queueCleanup();
+                    }
                 });
                 playerBootstrapObserver.observe(document.documentElement, {
                     childList: true,
@@ -1205,11 +1753,63 @@ internal static class AdBlockDocumentScript
                     stopPlayerBootstrapObservation,
                     10_000);
             };
+            const onUserInteraction = event => {
+                if (!event.isTrusted || !isYouTubeWatch()) return;
+                const video = document.querySelector('video.html5-main-video, video');
+                if (!video) return;
+
+                if (event.type === 'keydown') {
+                    if (event.key === ' ' || event.key === 'k' || event.key === 'K') {
+                        const tag = event.target?.tagName?.toLowerCase();
+                        if (tag === 'input' || tag === 'textarea' || event.target?.isContentEditable) return;
+                        userManuallyPaused = !video.paused;
+                        if (!userManuallyPaused) {
+                            lastPlayAttempt = 0;
+                            triggerInstantPlay();
+                        }
+                    }
+                    return;
+                }
+
+                if (event.type === 'click') {
+                    const largePlay = event.target?.closest?.('.ytp-large-play-button');
+                    if (largePlay) {
+                        userManuallyPaused = false;
+                        lastPlayAttempt = 0;
+                        autoplayAttempts = 0;
+                        try {
+                            const player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
+                            if (typeof player?.playVideo === 'function') player.playVideo();
+                        } catch (_) { }
+                        return;
+                    }
+                    const playBtn = event.target?.closest?.('.ytp-play-button');
+                    const nonPlayControl = event.target?.closest?.(
+                        'button, a, input, [role="button"], .ytp-chrome-bottom, .ytp-chrome-top, '
+                        + '.ytp-popup, .ytp-ad-module, .ytp-cards-teaser, .ytp-ce-element, .ytp-contextmenu');
+                    if (nonPlayControl && !playBtn) return;
+                    const playerEl = event.target?.closest?.('#movie_player, .html5-video-player');
+                    if (playBtn || playerEl) {
+                        userManuallyPaused = !video.paused;
+                        if (!userManuallyPaused) {
+                            lastPlayAttempt = 0;
+                            triggerInstantPlay();
+                        }
+                    }
+                }
+            };
             const onVisibilityChange = () => {
                 if (!document.hidden) queueCleanup();
                 scheduleFallback(false);
             };
             const onNavigationStart = () => {
+                adWasActive = false;
+                userManuallyPaused = false;
+                activeWatchVideoId = '';
+                autoplayAttempts = 0;
+                autoplayCompletedForVideoId = '';
+                lastPlayAttempt = 0;
+                watchPageLoadTime = performance.now();
                 clearRecoveryMask();
                 if (activeRecoveryMarker) setRecoveryMarker('');
                 recoveryVideoId = '';
@@ -1228,24 +1828,41 @@ internal static class AdBlockDocumentScript
                 transportRecoveryErrorNode = null;
                 transportRecoveryFastPollUntil = 0;
                 pendingRecoverySignal = false;
-                if (isYouTubeWatch()) armRecoveryMask();
             };
             const onNavigationFinish = () => {
+                userManuallyPaused = false;
+                activeWatchVideoId = new URLSearchParams(location.search).get('v') || '';
+                autoplayAttempts = 0;
+                autoplayCompletedForVideoId = '';
+                lastPlayAttempt = 0;
+                watchPageLoadTime = performance.now();
                 if (isYouTubeWatch()) {
                     resetTransportRecovery();
-                    armRecoveryMask();
                 } else {
                     clearRecoveryMask();
                 }
                 observePlayer();
                 startPlayerBootstrapObservation();
+                cleanPlayerAds();
+                triggerInstantPlay();
+                scheduleInstantPlayCheck();
                 queueCleanup();
             };
             const startCleanup = () => {
                 if (!isEnabled() || cleanupStarted || !document.documentElement) return;
                 cleanupStarted = true;
+                watchPageLoadTime = performance.now();
                 const activity = cleanPlayerAds();
-                playerObserver = new MutationObserver(queueCleanup);
+                triggerInstantPlay();
+                scheduleInstantPlayCheck();
+                playerObserver = new MutationObserver(() => {
+                    const player = observedPlayer || document.getElementById('movie_player');
+                    if (player?.classList?.contains('ad-showing') || player?.classList?.contains('ad-interrupting')) {
+                        queueUrgentCleanup();
+                    } else {
+                        queueCleanup();
+                    }
+                });
                 observePlayer();
                 startPlayerBootstrapObservation();
                 for (const eventName of cleanupEvents) {
@@ -1253,9 +1870,13 @@ internal static class AdBlockDocumentScript
                 }
                 document.addEventListener('yt-navigate-start', onNavigationStart, { passive: true });
                 document.addEventListener('yt-navigate-finish', onNavigationFinish, { passive: true });
+                try { window.addEventListener?.('popstate', onNavigationStart, { passive: true }); } catch (_) { }
                 document.addEventListener('visibilitychange', onVisibilityChange, { passive: true });
+                document.addEventListener('keydown', onUserInteraction, true);
+                document.addEventListener('click', onUserInteraction, true);
                 scheduleFallback(activity);
                 stopCleanup = () => {
+                    removeVideoHooks();
                     playerObserver?.disconnect();
                     stopPlayerBootstrapObservation();
                     window.clearTimeout(fallbackTimer);
@@ -1267,7 +1888,10 @@ internal static class AdBlockDocumentScript
                     }
                     document.removeEventListener('yt-navigate-start', onNavigationStart);
                     document.removeEventListener('yt-navigate-finish', onNavigationFinish);
+                    try { window.removeEventListener?.('popstate', onNavigationStart); } catch (_) { }
                     document.removeEventListener('visibilitychange', onVisibilityChange);
+                    document.removeEventListener('keydown', onUserInteraction, true);
+                    document.removeEventListener('click', onUserInteraction, true);
                 };
             };
             startCleanup();

@@ -420,7 +420,7 @@ internal sealed class AdBlockEngine
             "Script" => AdBlockResourceType.Script,
             "XmlHttpRequest" => AdBlockResourceType.XmlHttpRequest,
             "Fetch" => AdBlockResourceType.Fetch,
-            "Websocket" => AdBlockResourceType.WebSocket,
+            "Websocket" or "WebSocket" => AdBlockResourceType.WebSocket,
             "Ping" or "CspViolationReport" => AdBlockResourceType.Ping,
             "EventSource" => AdBlockResourceType.XmlHttpRequest,
             "TextTrack" => AdBlockResourceType.Media,
@@ -1520,6 +1520,7 @@ internal sealed class AdBlockEngine
 
         private static string? GetBadFilterTarget(string line)
         {
+            if (line.IndexOf("badfilter", StringComparison.OrdinalIgnoreCase) < 0) return null;
             var optionIndex = FindOptionIndex(line);
             if (optionIndex < 0) return null;
             var options = line.AsSpan(optionIndex + 1);

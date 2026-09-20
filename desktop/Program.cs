@@ -35,7 +35,7 @@ internal static class Program
         var startupAddress = ResolveStartupAddressCandidates(startupArguments.NavigationArguments);
         var singleInstanceIdentity = GetCurrentUserSingleInstanceIdentity();
 
-        using var mutex = new Mutex(true, singleInstanceIdentity.MutexName, out var isFirstInstance);
+        using var mutex = CreateSingleInstanceMutex(singleInstanceIdentity.MutexName, out var isFirstInstance);
         if (!isFirstInstance)
         {
             if (!SendNavigationToRunningInstance(singleInstanceIdentity.PipeName, startupAddress))
@@ -53,6 +53,8 @@ internal static class Program
 
         TryStartManagedStartupOptimization();
         ApplicationConfiguration.Initialize();
+        var shortcutFilter = new IncognitoShortcutMessageFilter();
+        Application.AddMessageFilter(shortcutFilter);
         var form = new MainForm(true, null, startupAddress);
         using var applicationContext = new BrowserApplicationContext();
         Volatile.Write(ref currentApplicationContext, applicationContext);
@@ -65,6 +67,7 @@ internal static class Program
         }
         finally
         {
+            Application.RemoveMessageFilter(shortcutFilter);
             Volatile.Write(ref currentApplicationContext, null);
         }
     }
@@ -109,6 +112,19 @@ internal static class Program
         return new SingleInstanceIdentity(
             $"Global\\MishaWeb-BrowserInstance-{userKey}",
             $"MishaWeb-BrowserInstancePipe-{userKey}");
+    }
+
+    private static Mutex CreateSingleInstanceMutex(string mutexName, out bool isFirstInstance)
+    {
+        try
+        {
+            return new Mutex(true, mutexName, out isFirstInstance);
+        }
+        catch (UnauthorizedAccessException) when (mutexName.StartsWith("Global\\", StringComparison.Ordinal))
+        {
+            var localName = "Local\\" + mutexName["Global\\".Length..];
+            return new Mutex(true, localName, out isFirstInstance);
+        }
     }
 
     private static void TryStartManagedStartupOptimization()
@@ -360,6 +376,10 @@ internal static class Program
     private static string? ResolveStartupAddressCandidates(string[] args)
     {
         if (args.Length == 0) return null;
+
+        var nonSwitchArgs = args.Where(a => !a.StartsWith('-') && !a.StartsWith('/')).ToArray();
+        if (nonSwitchArgs.Length == 0) return null;
+        args = nonSwitchArgs;
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var candidates = new List<string>();

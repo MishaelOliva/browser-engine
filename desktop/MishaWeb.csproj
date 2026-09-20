@@ -15,6 +15,7 @@
     <AssemblyVersion>2.2.0.0</AssemblyVersion>
     <FileVersion>2.2.0.0</FileVersion>
     <InformationalVersion>2.2.0</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AssemblyTitle>MishaWeb</AssemblyTitle>
     <Product>MishaWeb</Product>
     <Description>A resource-light native Windows browser powered by WebView2.</Description>

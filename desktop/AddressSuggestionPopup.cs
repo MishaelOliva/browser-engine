@@ -417,8 +417,9 @@ internal sealed class AddressSuggestionPopup : Control
         graphics.FillEllipse(iconBackground, iconBounds);
         var icon = suggestion.Source switch
         {
-            AddressSuggestionSource.Bookmark => "\u2665",
-            AddressSuggestionSource.History => "\u21BB",
+            AddressSuggestionSource.Bookmark => "\u2605",
+            AddressSuggestionSource.History when suggestion.IsSearchHistory => "\u21BB",
+            AddressSuggestionSource.History => "\u29C9",
             _ => "\u2315"
         };
         TextRenderer.DrawText(
@@ -432,7 +433,8 @@ internal sealed class AddressSuggestionPopup : Control
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
         var textLeft = iconBounds.Right + Scale(10);
-        var textWidth = Math.Max(10, row.Right - textLeft - Scale(42));
+        var badgeWidth = suggestion.IsTopMatch ? Scale(74) : 0;
+        var textWidth = Math.Max(10, row.Right - textLeft - Scale(42) - badgeWidth);
         var titleBounds = new Rectangle(textLeft, row.Top + Scale(7), textWidth, Scale(18));
         var detailBounds = new Rectangle(textLeft, titleBounds.Bottom, textWidth, Scale(16));
         TextRenderer.DrawText(
@@ -453,6 +455,33 @@ internal sealed class AddressSuggestionPopup : Control
             detailBounds,
             SystemInformation.HighContrast && selected ? SystemColors.HighlightText : SystemInformation.HighContrast ? SystemColors.WindowText : SecondaryTextColor,
             TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+
+        if (suggestion.IsTopMatch)
+        {
+            var badgeBounds = new Rectangle(
+                row.Right - Scale(40) - badgeWidth,
+                row.Top + ((row.Height - Scale(18)) / 2),
+                badgeWidth - Scale(6),
+                Scale(18));
+            using var badgeBrush = new SolidBrush(
+                SystemInformation.HighContrast
+                    ? selected ? SystemColors.Highlight : SystemColors.Window
+                    : Color.FromArgb(32, AccentColor));
+            using var badgePath = CreateRoundedPath(badgeBounds, Scale(4));
+            if (!SystemInformation.HighContrast)
+            {
+                graphics.FillPath(badgeBrush, badgePath);
+            }
+            TextRenderer.DrawText(
+                graphics,
+                "Top match",
+                SecondaryFont,
+                badgeBounds,
+                SystemInformation.HighContrast
+                    ? selected ? SystemColors.HighlightText : SystemColors.WindowText
+                    : AccentColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+        }
     }
 
     private void DrawRemoveButton(Graphics graphics, int index)

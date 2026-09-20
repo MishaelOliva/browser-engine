@@ -72,6 +72,7 @@ internal sealed class NativeStartPage : UserControl
     private bool compactLayout;
     private StartPageStatus currentStatus = StartPageStatus.Default;
     private StartPageLink[] currentQuickLinks = [];
+    private bool isPrivateModeActive;
 
     public NativeStartPage()
     {
@@ -235,21 +236,38 @@ internal sealed class NativeStartPage : UserControl
 
     public void SetPrivateMode(bool enabled)
     {
+        isPrivateModeActive = enabled;
+        badge.IsPrivateMode = enabled;
         if (enabled)
         {
-            taglineLabel.Text = string.Empty;
-            taglineLabel.AccessibleDescription = "Private browsing is isolated from MishaWeb saved items";
-            badge.AccessibleName = "Private browsing";
+            titleLabel.Text = "Incognito";
+            titleLabel.ForeColor = NativeUiTheme.Lavender;
+            taglineLabel.Text = "You're browsing in Incognito mode \u2014 history and cookies are not saved";
+            taglineLabel.ForeColor = Color.FromArgb(226, 185, 248);
+            taglineLabel.Font = new Font("Segoe UI Semibold", 10f);
+            taglineLabel.Visible = true;
+            taglineLabel.AccessibleDescription = "Incognito browsing is isolated from MishaWeb saved items";
+            badge.AccessibleName = "Incognito browsing";
+            quickLinksTitle.Visible = false;
+            quickLinksHost.Visible = false;
         }
         else
         {
+            titleLabel.Text = "MishaWeb";
+            titleLabel.ForeColor = PrimaryTextColor;
             taglineLabel.Text = string.Empty;
+            taglineLabel.ForeColor = SecondaryTextColor;
+            taglineLabel.Font = TaglineFont;
+            taglineLabel.Visible = false;
             taglineLabel.AccessibleDescription = string.Empty;
-            badge.AccessibleName = "MishaWeb";
+            badge.AccessibleName = "MishaWeb logo";
+            quickLinksTitle.Visible = true;
+            quickLinksHost.Visible = currentQuickLinks.Length > 0;
         }
         AccessibleDescription = enabled
-            ? "Private MishaWeb start page. Search or open a site; normal saved items are not available."
+            ? "Incognito MishaWeb start page. Search or open a site; normal saved items are not available."
             : "A lightweight page for starting a search or opening a quick link";
+        if (!arranging) PerformLayout();
         Invalidate(true);
     }
 
@@ -570,8 +588,12 @@ internal sealed class NativeStartPage : UserControl
         var highContrast = SystemInformation.HighContrast;
         BackColor = highContrast ? SystemColors.Window : PageColor;
         ForeColor = highContrast ? SystemColors.WindowText : PrimaryTextColor;
-        titleLabel.ForeColor = highContrast ? SystemColors.WindowText : PrimaryTextColor;
-        taglineLabel.ForeColor = highContrast ? SystemColors.WindowText : SecondaryTextColor;
+        titleLabel.ForeColor = highContrast
+            ? SystemColors.WindowText
+            : isPrivateModeActive ? NativeUiTheme.Lavender : PrimaryTextColor;
+        taglineLabel.ForeColor = highContrast
+            ? SystemColors.WindowText
+            : isPrivateModeActive ? Color.FromArgb(226, 185, 248) : SecondaryTextColor;
         quickLinksTitle.ForeColor = highContrast ? SystemColors.WindowText : SecondaryTextColor;
         card.Invalidate(true);
         foreach (var chip in featureChips) chip.Invalidate();
@@ -588,34 +610,45 @@ internal sealed class NativeStartPage : UserControl
             ScaleLogical(2));
 
         SetRowHeight(0, compact ? 56 : 66);
-        SetRowHeight(1, compact ? 36 : 42);
-        SetRowHeight(2, compact ? 6 : 10);
+        SetRowHeight(1, isPrivateModeActive ? (compact ? 48 : 58) : (compact ? 36 : 42));
+        SetRowHeight(2, isPrivateModeActive ? (compact ? 28 : 34) : (compact ? 6 : 10));
         SetRowHeight(3, compact ? 56 : 64);
         SetRowHeight(4, compact ? 8 : 12);
         var contentWidth = Math.Max(1, cardWidth - contentLayout.Padding.Horizontal);
         contentLayout.RowStyles[5].Height = 0;
-        SetRowHeight(6, compact ? 26 : 32);
 
-        if (hasQuickLinks)
+        if (isPrivateModeActive)
         {
-            var columns = DetermineQuickLinkColumns(quickLinksHost.Controls.Count, contentWidth);
-            var rows = Math.Max(1, (int)Math.Ceiling(quickLinksHost.Controls.Count / (double)columns));
-            var quickLinkHeight = ScaleLogical(compact ? 56 : 62);
-            var gap = ScaleLogical(compact ? 6 : 8);
-            contentLayout.RowStyles[7].Height = (rows * quickLinkHeight) + ((rows - 1) * gap);
+            SetRowHeight(6, 0);
+            contentLayout.RowStyles[7].Height = 0;
+            quickLinksTitle.Visible = false;
+            quickLinksHost.Visible = false;
         }
         else
         {
-            contentLayout.RowStyles[7].Height = 0;
+            SetRowHeight(6, compact ? 26 : 32);
+            if (hasQuickLinks)
+            {
+                var columns = DetermineQuickLinkColumns(quickLinksHost.Controls.Count, contentWidth);
+                var rows = Math.Max(1, (int)Math.Ceiling(quickLinksHost.Controls.Count / (double)columns));
+                var quickLinkHeight = ScaleLogical(compact ? 56 : 62);
+                var gap = ScaleLogical(compact ? 6 : 8);
+                contentLayout.RowStyles[7].Height = (rows * quickLinkHeight) + ((rows - 1) * gap);
+            }
+            else
+            {
+                contentLayout.RowStyles[7].Height = 0;
+            }
+
+            quickLinksTitle.Text = hasQuickLinks
+                ? "Quick links"
+                : "Quick links \u00B7 Add favorites to see them here";
+            quickLinksTitle.AccessibleName = quickLinksTitle.Text;
+            quickLinksTitle.Visible = true;
+            quickLinksHost.Visible = hasQuickLinks;
         }
 
         featureHost.Visible = false;
-        quickLinksTitle.Text = hasQuickLinks
-            ? "Quick links"
-            : "Quick links \u00B7 Add favorites to see them here";
-        quickLinksTitle.AccessibleName = quickLinksTitle.Text;
-        quickLinksTitle.Visible = true;
-        quickLinksHost.Visible = hasQuickLinks;
     }
 
     private void SetRowHeight(int index, int logicalHeight)
@@ -1762,6 +1795,8 @@ internal sealed class NativeStartPage : UserControl
 
     private sealed class BadgeControl : Control
     {
+        public bool IsPrivateMode { get; set; }
+
         public BadgeControl()
         {
             SetStyle(
@@ -1780,6 +1815,29 @@ internal sealed class NativeStartPage : UserControl
         protected override void OnPaint(PaintEventArgs e)
         {
             StartPageArtwork.DrawBrandMark(e.Graphics, ClientRectangle);
+            if (!IsPrivateMode) return;
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var badgeSize = Math.Max(10, Math.Min(ClientRectangle.Width, ClientRectangle.Height) / 3);
+            var badgeBounds = new Rectangle(
+                ClientRectangle.Right - badgeSize - 2,
+                ClientRectangle.Bottom - badgeSize - 2,
+                badgeSize,
+                badgeSize);
+            using var fill = new SolidBrush(NativeUiTheme.Lavender);
+            using var border = new Pen(Color.FromArgb(120, 60, 148), 1f);
+            e.Graphics.FillEllipse(fill, badgeBounds);
+            e.Graphics.DrawEllipse(border, badgeBounds);
+            TextRenderer.DrawText(
+                e.Graphics,
+                "I",
+                Font,
+                badgeBounds,
+                NativeUiTheme.AccentText,
+                TextFormatFlags.HorizontalCenter
+                | TextFormatFlags.VerticalCenter
+                | TextFormatFlags.NoPadding
+                | TextFormatFlags.SingleLine);
         }
     }
 }
