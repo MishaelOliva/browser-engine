@@ -1,6 +1,6 @@
 # MishaWeb — High-Performance Desktop Browser & Custom Engine Subsystems
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![Windows Release Verification](https://github.com/MishaelOliva/browser-engine/actions/workflows/windows.yml/badge.svg)](https://github.com/MishaelOliva/browser-engine/actions/workflows/windows.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue.svg)]()
 [![Framework](https://img.shields.io/badge/.NET-10.0%20LTS-purple.svg)]()
 [![Language](https://img.shields.io/badge/language-C%23%2013-blue.svg)]()
