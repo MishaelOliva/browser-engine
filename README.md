@@ -206,6 +206,25 @@ MishaWeb/
 - **SDK:** [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (Version 10.0.103+ pinned in `global.json`)
 - **Node.js:** v18+ (optional, for convenience scripts)
 
+### All-in-One Installer (Automated Setup)
+
+You can install MishaWeb with a single click or command. The installer configures the application in `%LOCALAPPDATA%\Programs\MishaWeb`, validates or compiles single-file `MishaWeb.exe`, creates Desktop and Start Menu shortcuts, and presents a native completion pop-up dialog with an option to immediately launch `MishaWeb.exe`.
+
+- **Option A: 1-Click Batch Launcher**  
+  Double-click [`Install-MishaWeb.bat`](Install-MishaWeb.bat) at the root of the repository.
+
+- **Option B: PowerShell Script**
+  ```powershell
+  # Run directly from local clone:
+  .\build\Install-MishaWeb.ps1
+
+  # Or run via npm:
+  npm run desktop:install
+
+  # Or standalone 1-liner from PowerShell (downloads entire repo from GitHub):
+  irm https://raw.githubusercontent.com/MishaelOliva/browser-engine/main/build/Install-MishaWeb.ps1 | iex
+  ```
+
 ### Development Workflow
 
 ```powershell

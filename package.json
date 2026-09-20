@@ -13,6 +13,7 @@
     "desktop:one-click": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode OneClick",
     "desktop:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode Portable",
     "desktop:verify-publish": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode FrameworkDependent -ValidateOnly",
-    "desktop:verify-portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode Portable -ValidateOnly"
+    "desktop:verify-portable": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Publish-MishaWeb.ps1 -Mode Portable -ValidateOnly",
+    "desktop:install": "powershell -NoProfile -ExecutionPolicy Bypass -File build/Install-MishaWeb.ps1"
   }
 }
