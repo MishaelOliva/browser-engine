@@ -17,12 +17,12 @@ scratch/
 desktop.tests/critique-output*/
 desktop.tests/probe-*/
 
-MishaWeb.exe
-MishaWeb.release.json
-MishaWeb.sha256
-THIRD-PARTY-NOTICES.txt
-DOTNET-LICENSE.txt
-DOTNET-THIRD-PARTY-NOTICES.txt
+/MishaWeb.exe
+/MishaWeb.release.json
+/MishaWeb.sha256
+/THIRD-PARTY-NOTICES.txt
+/DOTNET-LICENSE.txt
+/DOTNET-THIRD-PARTY-NOTICES.txt
 .MishaWeb.*.incoming-*
 build/.one-click-backup-*/
 MishaWeb.pdb
